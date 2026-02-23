@@ -839,10 +839,6 @@ class OttoNavigator:
         # The label area is clickable and reveals the full energy sheet
         for click_sel in [
             ".pdp_eek__label",
-            "[class*='pdp_eek__label']",
-            ".js_openInPaliSheet",
-            "img.pdp_eek__label-img",
-            "[class*='pdp_eek'] [class*='label']",
         ]:
             try:
                 el = self.page.locator(click_sel).first
@@ -858,56 +854,38 @@ class OttoNavigator:
     # ENERGY CLASS — from product page DOM
     # ------------------------------------------------------------------
     def get_energy_class_from_page(self) -> str:
-        """Extract energy class from img.pdp_eek__label-img alt attribute."""
+        """Extract energy class strictly from .pdp_eek__label only."""
         logger.info("Extracting energy class from page...")
 
         # Scroll to the energy section first
         self._scroll_to_energy_section()
 
-        # Method 1: img.pdp_eek__label-img alt="A"
+        # Strict method: class must come from .pdp_eek__label block only
         try:
-            el = self.page.locator("img.pdp_eek__label-img").first
-            if el.count() > 0:
+            label = self.page.locator(".pdp_eek__label").first
+            if label.count() > 0:
+                el = label.locator("img.pdp_eek__label-img").first
                 alt = (el.get_attribute("alt") or "").strip()
                 if re.fullmatch(r"[A-G][+]{0,3}", alt):
-                    logger.info(f"Energy class from page: {alt}")
+                    logger.info(f"Energy class from .pdp_eek__label img alt: {alt}")
                     return alt
+
                 src = el.get_attribute("src") or ""
                 m = re.search(r"pl_eek_([a-g])", src, re.I)
                 if m:
-                    logger.info(f"Energy class from src: {m.group(1).upper()}")
+                    logger.info(f"Energy class from .pdp_eek__label img src: {m.group(1).upper()}")
                     return m.group(1).upper()
-        except Exception:
-            pass
 
-        # Method 2: Text inside pdp_eek container
-        try:
-            el = self.page.locator("[class*='pdp_eek']").first
-            if el.count() > 0:
-                text = el.inner_text().strip()
+                # Fallback inside label text only (still strict to selector)
+                text = label.inner_text().strip()
                 m = re.search(r"\b([A-G])\+{0,3}\b", text)
                 if m:
-                    logger.info(f"Energy class from eek text: {m.group(0)}")
+                    logger.info(f"Energy class from .pdp_eek__label text: {m.group(0)}")
                     return m.group(0)
         except Exception:
             pass
 
-        # Method 3: Any img with src containing pl_eek
-        try:
-            imgs = self.page.locator("img[src*='pl_eek']").all()
-            for img in imgs:
-                src = img.get_attribute("src") or ""
-                m = re.search(r"pl_eek_([a-g])", src, re.I)
-                if m:
-                    logger.info(f"Energy class from img src: {m.group(1).upper()}")
-                    return m.group(1).upper()
-                alt = (img.get_attribute("alt") or "").strip()
-                if re.fullmatch(r"[A-G][+]{0,3}", alt):
-                    return alt
-        except Exception:
-            pass
-
-        logger.info("Energy class not found on page")
+        logger.info("Energy class not found in .pdp_eek__label")
         return ""
 
     # ------------------------------------------------------------------
@@ -1595,13 +1573,14 @@ class Scraper:
             # Supplier from "Details zur Produktsicherheit" popup
             supplier = nav.get_supplier_from_page()
 
-            # PDF link + PDF fallback (with brand validation)
+            # PDF link + PDF parsing (supplier fallback only)
             pdf = nav.get_pdf_link()
-            pdf_energy, pdf_supplier = self.pdf.extract_fields(pdf, brand)
+            _pdf_energy, pdf_supplier = self.pdf.extract_fields(pdf, brand)
 
-            # Use PDF data only as fallback
-            if not energy and pdf_energy and pdf_energy != "Not found":
-                energy = pdf_energy
+            # Strict rule: energy must come from .pdp_eek__label on page.
+            # If energy image link is missing, mark energy as not found too.
+            if not energy_img or energy_img == "Not found":
+                energy = ""
             if not supplier and pdf_supplier and pdf_supplier != "Not found":
                 supplier = pdf_supplier
 
