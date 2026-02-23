@@ -487,7 +487,7 @@ class OttoNavigator:
                     all_scored.append(scored)
 
             # After collecting, check if we have a good strict match
-            strict = [s for s in all_scored if s[0] >= 30]
+            strict = [s for s in all_scored if s[0] >= 30 and s[3]]
             if strict:
                 strict.sort(key=lambda x: (-x[0], x[1]))
                 best = strict[0]
@@ -502,7 +502,7 @@ class OttoNavigator:
             time.sleep(BH.short_delay())
 
         # No strict match found — try relaxed
-        relaxed = [s for s in all_scored if s[0] >= 15]
+        relaxed = [s for s in all_scored if s[0] >= 15 and s[3]]
         if relaxed:
             relaxed.sort(key=lambda x: (-x[0], x[1]))
             best = relaxed[0]
@@ -513,7 +513,7 @@ class OttoNavigator:
             return self._click_candidate(best)
 
         # Last resort — any non-accessory match with brand + product line
-        brand_only = [s for s in all_scored if s[0] >= 5]
+        brand_only = [s for s in all_scored if s[0] >= 5 and s[3]]
         if brand_only:
             brand_only.sort(key=lambda x: (-x[0], x[1]))
             best = brand_only[0]
@@ -523,11 +523,19 @@ class OttoNavigator:
             )
             return self._click_candidate(best)
 
+        if qi.model_number:
+            logger.info(
+                "No valid match: model mismatch/conflict across candidates "
+                f"(required model={qi.model_number})"
+            )
+
         return False
 
     def _evaluate_card(self, card, idx: int,
                        qi: QueryInfo) -> Optional[tuple]:
-        """Evaluate a single product card. Returns (score, idx, link) or None."""
+        """Evaluate a single product card.
+        Returns (score, idx, link, model_ok) or None.
+        """
         try:
             raw_text = card.inner_text()
             raw_lower = raw_text.lower()
@@ -608,6 +616,15 @@ class OttoNavigator:
                    ["smartphone", "handy", "mobiltelefon"]):
                 score += 5
 
+            # Candidate must satisfy model correctness when a model is requested.
+            model_ok = True
+            if qi.model_number:
+                has_model = bool(
+                    self._model_near(combined, qi)
+                    or re.search(rf"\b{re.escape(qi.model_number)}\b", combined)
+                )
+                model_ok = has_model and (not self._conflicting_model(combined, qi))
+
             # Must have positive score
             if score <= 0:
                 return None
@@ -619,7 +636,7 @@ class OttoNavigator:
                 if link.count() == 0:
                     return None
 
-            return (score, idx, link)
+            return (score, idx, link, model_ok)
 
         except Exception as e:
             logger.debug(f"Card eval error: {e}")
@@ -675,7 +692,7 @@ class OttoNavigator:
 
     def _click_candidate(self, candidate: tuple) -> bool:
         """Click on a scored candidate and navigate to product page."""
-        _, _, link = candidate
+        _, _, link, _ = candidate
         try:
             BH.mouse_move(self.page)
             time.sleep(BH.short_delay())
