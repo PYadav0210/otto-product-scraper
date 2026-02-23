@@ -1,11 +1,13 @@
 """
 Otto.de Product Information Scraper
 
-Scrapes product data from otto.de including:
-- Product URLs
-- PDF product datasheet links
+Multi-pass matching strategy:
+  Pass 1 (STRICT):  product_line + model + sub_family + variants must all match
+  Pass 2 (RELAXED): product_line + model must match (ignores variant/sub-family)
+  Pass 3 (BRAND):   brand + model only (last resort)
 
-Mimics human browsing behavior with delays and realistic interactions.
+This ensures the scraper always finds the best available match even when
+the exact variant isn't listed on otto.de.
 """
 
 from pathlib import Path
@@ -28,17 +30,14 @@ from playwright.sync_api import sync_playwright, Page
 # ============================================================================
 
 class Config:
-    """Application configuration"""
     INPUT_FILE = "article_numbers.txt"
     OUTPUT_FILE = "otto_products_report.csv"
-    
-    # Browser settings
+
     HEADLESS = False
     SLOW_MO = 20
     VIEWPORT_WIDTH = 1920
     VIEWPORT_HEIGHT = 1080
-    
-    # Human-like delays (seconds)
+
     MIN_DELAY = 0.15
     MAX_DELAY = 0.5
     KEYSTROKE_DELAY_MIN = 0.01
@@ -49,7 +48,6 @@ class Config:
     SCROLL_MAX = 700
     DEFAULT_TIMEOUT_MS = 15000
 
-    # OCR settings (for image-only PDFs)
     OCR_ENABLED = True
     OCR_DPI = 200
     OCR_LANG = "eng+deu"
@@ -57,30 +55,19 @@ class Config:
     TESSERACT_CMD = "/opt/homebrew/bin/tesseract"
 
 
-# ============================================================================
-# DATA MODELS
-# ============================================================================
-
 @dataclass
 class ProductData:
-    """Product information"""
     input_ean: str
     product_url: str
     pdf_link: str
     energy_efficiency_class: str
+    energylevel_link: str
     supplier_information: str
 
 
-# ============================================================================
-# LOGGING
-# ============================================================================
-
 def setup_logging() -> logging.Logger:
-    """Configure logging"""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s'
-    )
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s - %(levelname)s - %(message)s")
     return logging.getLogger(__name__)
 
 
@@ -88,341 +75,728 @@ logger = setup_logging()
 
 
 # ============================================================================
-# BROWSER INTERACTION
+# BRAND / MODEL UTILITIES
 # ============================================================================
 
-class BrowserHelper:
-    """Helper methods for browser interaction"""
-    
+BRAND_FAMILIES = {
+    "apple": {
+        "product_lines": ["iphone", "ipad", "macbook", "mac"],
+        "model_re": r"(?:iphone|ipad)\s*(\d{1,2})",
+        "category": "phone",
+    },
+    "samsung": {
+        "product_lines": ["galaxy"],
+        "model_re": r"galaxy\s*(?:z\s*)?(?:flip|fold|s|a|m|note)\s*(\d{1,2})",
+        "category": "phone",
+    },
+    "google": {
+        "product_lines": ["pixel"],
+        "model_re": r"pixel\s*(\d{1,2})",
+        "category": "phone",
+    },
+    "oneplus": {
+        "product_lines": ["oneplus"],
+        "model_re": r"oneplus\s*(\d{1,2})",
+        "category": "phone",
+    },
+    "xiaomi": {
+        "product_lines": ["xiaomi", "redmi", "poco"],
+        "model_re": r"(?:xiaomi|redmi|poco)\s*(?:note\s*)?(\d{1,2})",
+        "category": "phone",
+    },
+    "huawei": {
+        "product_lines": ["huawei", "mate"],
+        "model_re": r"(?:huawei|mate|p)\s*(\d{1,2})",
+        "category": "phone",
+    },
+    "sony": {
+        "product_lines": ["xperia"],
+        "model_re": r"xperia\s*(\w+)",
+        "category": "phone",
+    },
+    "motorola": {
+        "product_lines": ["moto", "motorola"],
+        "model_re": r"moto(?:rola)?\s*(\w+)",
+        "category": "phone",
+    },
+    "nothing": {
+        "product_lines": ["nothing"],
+        "model_re": r"nothing\s*phone\s*\(?(\d+)\)?",
+        "category": "phone",
+    },
+}
+
+VARIANT_TOKENS = ["pro", "max", "ultra", "plus", "lite", "fe", "mini", "xl"]
+
+# ---------------------------------------------------------------------------
+# Accessory keywords — checked against BOTH normalised AND raw lowered text
+# ---------------------------------------------------------------------------
+ACCESSORY_KEYWORDS_NORM = frozenset({
+    "huelle", "case", "cover", "bumper", "handyhuelle",
+    "schale", "schutzhuelle", "backcover", "flipcase", "bookcase",
+    "klapphuelle", "klappcover", "etui", "silikonhuelle",
+    "displayschutz", "folie", "schutzfolie", "schutzglas", "panzerglas",
+    "panzerfolie", "displayfolie",
+    "kabel", "ladekabel", "netzteil",
+    "earphone", "earphones", "headphone", "headphones",
+    "earbud", "earbuds", "headset",
+    "halter", "halterung", "autohalterung",
+    "staender", "stativ", "handyhalterung",
+    "magnethalterung", "saugnapf",
+    "tasche", "pouch",
+    "ersatzakku", "powerbank",
+    "wristband", "stylus", "eingabestift",
+    "reinigung", "reinigungsset", "cleaning", "selfiestick",
+    "ringhalter", "fingerhalter", "popgrip", "popsocket",
+    "simkarte", "speicherkarte", "sdkarte",
+})
+
+ACCESSORY_KEYWORDS_RAW = frozenset({
+    "hülle", "huelle", "schutzhülle", "schutzhuelle", "handyhülle",
+    "handyhuelle", "schutzfolie", "panzerglas", "panzerfolie",
+    "screen protector", "tempered glass",
+    "halter", "halterung", "kfz-halter", "kfz-halterung",
+    "kfz halter", "kfz halterung", "lüfterhalter", "luefterhalter",
+    "autohalterung", "handyhalterung",
+    "ladegerät", "ladegeraet", "ladekabel", "netzteil",
+    "kopfhörer", "kopfhoerer", "headset", "earbuds",
+    "tasche", "pouch", "gürteltasche",
+    "powerbank", "ersatzakku",
+    "selfiestick", "selfie-stick",
+    "popgrip", "popsocket",
+    "silikon case", "silikon hülle", "tpu case", "tpu hülle",
+    "hardcase", "hard case", "kfz", "charger", "adapter", "armband",
+    # English terms from Otto's English UI
+    "phone case", "protective case", "slim case",
+})
+
+WRONG_CATEGORY_KEYWORDS = frozenset({
+    "macbook", "notebook", "laptop", "imac", "mac mini", "mac studio",
+    "mac pro", "airpods", "apple watch", "watch ultra", "homepod",
+    "apple tv", "airtag", "magic keyboard", "magic mouse", "magic trackpad",
+    "galaxy tab", "galaxy watch", "galaxy buds",
+    "pixel watch", "pixel buds", "pixel tablet",
+    "smart tv", "fernseher", "monitor", "drucker", "printer",
+})
+
+NOISE_WORDS = {
+    "gb", "tb", "speicher", "farbe", "dual", "sim", "dualsim",
+    "schwarz", "weiss", "silber", "rot", "blau", "gruen",
+    "white", "black", "blue", "green", "red", "silver", "gold",
+    "pink", "pinkgold", "titanium", "cosmic", "orange", "navy",
+    "mint", "iris", "moonstone",
+    "128", "256", "512", "1000", "64", "32",
+}
+
+
+# ============================================================================
+# QUERY ANALYSIS
+# ============================================================================
+
+@dataclass
+class QueryInfo:
+    """Parsed information about what we're searching for."""
+    raw: str
+    norm: str
+    brand: Optional[str]
+    product_line: str        # "iphone", "galaxy", "pixel"
+    samsung_sub: str         # "flip", "fold", "s", "a", etc.
+    model_number: str        # "17", "25", "7", "9"
+    variant_tokens: list     # ["pro", "max"], ["ultra"], ["fe"]
+    search_tokens: list      # all meaningful tokens for scoring
+
+    @classmethod
+    def from_query(cls, query: str) -> "QueryInfo":
+        norm = _normalize(query)
+        brand = _detect_brand(norm)
+        product_line = _extract_product_line(norm, brand)
+        samsung_sub = _extract_samsung_sub(norm)
+        model_number = _extract_model(norm, brand)
+        variants = _extract_variants(norm)
+        tokens = _tokenize(norm)
+        return cls(query, norm, brand, product_line, samsung_sub,
+                   model_number, variants, tokens)
+
+    def log(self):
+        logger.info(
+            f"  brand={self.brand}  line={self.product_line}  "
+            f"sub={self.samsung_sub}  model={self.model_number}  "
+            f"variants={self.variant_tokens}  tokens={self.search_tokens}"
+        )
+
+
+def _detect_brand(qn: str) -> Optional[str]:
+    for brand, info in BRAND_FAMILIES.items():
+        if brand in qn:
+            return brand
+        for pl in info["product_lines"]:
+            if re.search(rf"\b{re.escape(pl)}\b", qn):
+                return brand
+    return None
+
+
+def _extract_product_line(qn: str, brand: Optional[str]) -> str:
+    if not brand or brand not in BRAND_FAMILIES:
+        return ""
+    for pl in BRAND_FAMILIES[brand]["product_lines"]:
+        if re.search(rf"\b{re.escape(pl)}\b", qn):
+            return pl
+    return ""
+
+
+def _extract_samsung_sub(qn: str) -> str:
+    m = re.search(r"galaxy\s+(?:z\s+)?(flip|fold)\s*\d", qn)
+    if m:
+        return m.group(1)
+    m = re.search(r"galaxy\s+(?:z\s+)?(flip|fold)\d", qn)
+    if m:
+        return m.group(1)
+    m = re.search(r"galaxy\s+(s|a|m|note)\s*\d", qn)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _extract_model(qn: str, brand: Optional[str]) -> str:
+    if brand and brand in BRAND_FAMILIES:
+        m = re.search(BRAND_FAMILIES[brand]["model_re"], qn, re.I)
+        if m:
+            return m.group(1)
+    m = re.search(r"\b(\d{1,2})\b", qn)
+    return m.group(1) if m else ""
+
+
+def _extract_variants(qn: str) -> list[str]:
+    return [t for t in VARIANT_TOKENS if re.search(rf"\b{t}\b", qn)]
+
+
+def _tokenize(qn: str) -> list[str]:
+    return [t for t in qn.split() if t and t not in NOISE_WORDS]
+
+
+# ============================================================================
+# TEXT UTILITIES
+# ============================================================================
+
+def _normalize(text: str) -> str:
+    text = text.lower()
+    # Split joined tokens: "flip7" -> "flip 7", "128gb" -> "128 gb"
+    text = re.sub(r"([a-z\u00e4\u00f6\u00fc\u00df])(\d)", r"\1 \2", text)
+    text = re.sub(r"(\d)([a-z\u00e4\u00f6\u00fc\u00df])", r"\1 \2", text)
+    text = re.sub(r"[^a-z0-9\u00e4\u00f6\u00fc\u00df]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _match_score(text: str, tokens: list[str]) -> int:
+    return sum(1 for t in tokens
+               if re.search(rf"\b{re.escape(t)}\b", text))
+
+
+def _is_accessory(title_norm: str, card_norm: str, raw_lower: str) -> bool:
+    for kw in ACCESSORY_KEYWORDS_NORM:
+        if kw in title_norm or kw in card_norm:
+            return True
+    for kw in ACCESSORY_KEYWORDS_RAW:
+        if kw in raw_lower:
+            return True
+    return False
+
+
+def _is_wrong_category(combined: str, raw_lower: str,
+                       brand: Optional[str]) -> bool:
+    if brand and BRAND_FAMILIES.get(brand, {}).get("category") == "phone":
+        for kw in WRONG_CATEGORY_KEYWORDS:
+            if kw in combined or kw in raw_lower:
+                return True
+    return False
+
+
+def _is_sponsored(raw_lower: str) -> bool:
+    return ("gesponsert" in raw_lower or "anzeige" in raw_lower
+            or "sponsored" in raw_lower)
+
+
+# ============================================================================
+# BROWSER HELPERS
+# ============================================================================
+
+class BH:
     @staticmethod
-    def human_type(element, text: str) -> None:
-        """Type text with human-like pauses"""
-        element.click()
-        element.fill("")
-        
-        for char in text:
-            element.type(char)
-            time.sleep(random.uniform(
-                Config.KEYSTROKE_DELAY_MIN,
-                Config.KEYSTROKE_DELAY_MAX
-            ))
-    
+    def human_type(el, text: str):
+        el.click()
+        el.fill("")
+        for c in text:
+            el.type(c)
+            time.sleep(random.uniform(Config.KEYSTROKE_DELAY_MIN,
+                                      Config.KEYSTROKE_DELAY_MAX))
+
     @staticmethod
-    def random_mouse_move(page: Page) -> None:
-        """Move mouse to random position"""
+    def mouse_move(page: Page):
         try:
-            page.mouse.move(
-                random.randint(100, 500),
-                random.randint(100, 500)
-            )
-        except:
+            page.mouse.move(random.randint(100, 500),
+                            random.randint(100, 500))
+        except Exception:
             pass
-    
+
     @staticmethod
-    def random_scroll(page: Page) -> None:
-        """Small random scroll to mimic browsing"""
+    def scroll(page: Page, amount: int = 0):
         try:
-            page.mouse.wheel(
-                0,
-                random.randint(Config.SCROLL_MIN, Config.SCROLL_MAX)
-            )
-        except:
+            page.mouse.wheel(0, amount or random.randint(
+                Config.SCROLL_MIN, Config.SCROLL_MAX))
+        except Exception:
             pass
-    
+
     @staticmethod
-    def human_delay() -> float:
-        """Get random delay between requests"""
+    def delay():
         return random.uniform(Config.MIN_DELAY, Config.MAX_DELAY)
-    
+
     @staticmethod
-    def action_delay() -> float:
-        """Short delay between interactions"""
-        return random.uniform(Config.ACTION_DELAY_MIN, Config.ACTION_DELAY_MAX)
+    def short_delay():
+        return random.uniform(Config.ACTION_DELAY_MIN,
+                              Config.ACTION_DELAY_MAX)
+
+
+# ============================================================================
+# OTTO NAVIGATOR
+# ============================================================================
+
+# Multiple selectors for product cards — Otto's HTML may vary
+CARD_SELECTORS = [
+    "article",
+    "[data-testid*='product']",
+    ".product-card",
+    ".js_productCard",
+    "[class*='productCard']",
+    "[class*='ProductCard']",
+]
 
 
 class OttoNavigator:
-    """Navigate otto.de and extract product information"""
-    
     def __init__(self, page: Page):
         self.page = page
-        self._cookies_accepted = False
-    
-    def accept_cookies(self) -> None:
-        """Click cookie consent if present"""
+        self._cookies_done = False
+
+    def accept_cookies(self):
         try:
-            if self._cookies_accepted:
+            if self._cookies_done:
                 return
             time.sleep(random.uniform(0.6, 1.2))
-            button = self.page.locator("#onetrust-accept-btn-handler")
-            if button.count() > 0:
-                button.click(timeout=5000)
-                logger.info("Cookies accepted")
-                time.sleep(random.uniform(0.3, 0.7))
-            self._cookies_accepted = True
-        except:
+            for sel in ["#onetrust-accept-btn-handler",
+                        "button:has-text('Akzeptieren')",
+                        "button:has-text('Accept')"]:
+                btn = self.page.locator(sel)
+                if btn.count() > 0:
+                    btn.first.click(timeout=5000)
+                    logger.info("Cookies accepted")
+                    time.sleep(random.uniform(0.3, 0.7))
+                    break
+            self._cookies_done = True
+        except Exception:
             pass
-    
-    def search_product(self, query: str) -> None:
-        """Navigate to otto.de and search for product"""
-        logger.info(f"Navigating to Otto.de and searching for: {query}")
+
+    def search_product(self, query: str):
+        logger.info(f"Searching: {query}")
         self.page.goto("https://www.otto.de/", wait_until="domcontentloaded")
-        
         self.accept_cookies()
-        BrowserHelper.random_mouse_move(self.page)
-        time.sleep(BrowserHelper.action_delay())
-        
-        # Find search input
+        BH.mouse_move(self.page)
+        time.sleep(BH.short_delay())
+
         search_box = None
-        selectors = [
-            "input[type='search']",
-            "input[name='q']",
-            "input[placeholder*='Suchen' i]",
-            "header input"
-        ]
-        
-        for selector in selectors:
+        for sel in ["input[type='search']", "input[name='q']",
+                    "input[placeholder*='Suchen' i]",
+                    "input[placeholder*='Search' i]",
+                    "header input"]:
             try:
-                element = self.page.locator(selector).first
-                element.wait_for(state="visible", timeout=10000)
-                search_box = element
+                el = self.page.locator(sel).first
+                el.wait_for(state="visible", timeout=10000)
+                search_box = el
                 break
-            except:
+            except Exception:
                 continue
-        
+
         if not search_box:
             raise Exception("Search box not found")
-        
-        # Type and search
-        BrowserHelper.human_type(search_box, query)
-        time.sleep(BrowserHelper.action_delay())
+
+        BH.human_type(search_box, query)
+        time.sleep(BH.short_delay())
         search_box.press("Enter")
-        
-        logger.info("Waiting for search results...")
+
         self.page.wait_for_load_state("domcontentloaded")
-        try:
-            self.page.wait_for_selector("article", timeout=6000)
-        except:
-            pass
-    
+        self._wait_for_cards()
+
+    def _wait_for_cards(self):
+        """Wait for product cards to appear using multiple selectors."""
+        for sel in CARD_SELECTORS:
+            try:
+                self.page.wait_for_selector(sel, timeout=4000)
+                return
+            except Exception:
+                continue
+        logger.warning("No product cards found with any selector")
+
+    def _get_cards(self):
+        """Get all product card elements using the first matching selector."""
+        for sel in CARD_SELECTORS:
+            cards = self.page.locator(sel).all()
+            if cards:
+                return cards
+        return []
+
+    # ------------------------------------------------------------------
+    # MULTI-PASS PRODUCT FINDING
+    # ------------------------------------------------------------------
     def find_product(self, query: str) -> bool:
-        """Find main product (skip sponsored items and accessories)"""
-        # Already on product page?
+        """Find the correct product using a multi-pass strategy:
+        Pass 1: Strict (all criteria)
+        Pass 2: Relaxed (brand + product_line + model, ignore variants)
+        Pass 3: Brand only (brand + product_line, ignore model)
+        """
         if "/p/" in self.page.url:
             logger.info(f"Already on product page: {self.page.url}")
             return True
-        
-        logger.info("Looking for actual product in search results...")
+
+        qi = QueryInfo.from_query(query)
+        qi.log()
+
+        # Try strict matching first, with scrolling
+        result = self._find_with_passes(qi)
+        if result:
+            return True
+
+        logger.error(f"No product found for: {query}")
+        return False
+
+    def _find_with_passes(self, qi: QueryInfo) -> bool:
+        """Scroll through results trying strict, then relaxed, then brand-only."""
+        # Collect all cards across multiple scroll positions
+        all_scored: list[tuple] = []
+
+        for scroll_attempt in range(10):
+            cards = self._get_cards()
+            if not cards:
+                logger.warning(
+                    f"No cards found (scroll {scroll_attempt}), trying next selector..."
+                )
+                BH.scroll(self.page, 1200)
+                time.sleep(BH.short_delay())
+                continue
+
+            for idx, card in enumerate(cards):
+                scored = self._evaluate_card(card, idx, qi)
+                if scored:
+                    all_scored.append(scored)
+
+            # After collecting, check if we have a good strict match
+            strict = [s for s in all_scored if s[0] >= 30]
+            if strict:
+                strict.sort(key=lambda x: (-x[0], x[1]))
+                best = strict[0]
+                logger.info(
+                    f"STRICT match: position #{best[1]}, "
+                    f"score={best[0]}"
+                )
+                return self._click_candidate(best)
+
+            # Scroll to load more
+            BH.scroll(self.page, 1200)
+            time.sleep(BH.short_delay())
+
+        # No strict match found — try relaxed
+        relaxed = [s for s in all_scored if s[0] >= 15]
+        if relaxed:
+            relaxed.sort(key=lambda x: (-x[0], x[1]))
+            best = relaxed[0]
+            logger.info(
+                f"RELAXED match: position #{best[1]}, "
+                f"score={best[0]}"
+            )
+            return self._click_candidate(best)
+
+        # Last resort — any non-accessory match with brand + product line
+        brand_only = [s for s in all_scored if s[0] >= 5]
+        if brand_only:
+            brand_only.sort(key=lambda x: (-x[0], x[1]))
+            best = brand_only[0]
+            logger.info(
+                f"BRAND-ONLY match: position #{best[1]}, "
+                f"score={best[0]}"
+            )
+            return self._click_candidate(best)
+
+        return False
+
+    def _evaluate_card(self, card, idx: int,
+                       qi: QueryInfo) -> Optional[tuple]:
+        """Evaluate a single product card. Returns (score, idx, link) or None."""
         try:
-            self.page.wait_for_selector("article", timeout=8000)
-        except:
-            pass
-        query_norm = self._normalize_text(query)
-        model_number = self._extract_model_number(query_norm)
-        required_tokens = self._tokenize_query_loose(query_norm)
+            raw_text = card.inner_text()
+            raw_lower = raw_text.lower()
+            title = self._extract_title(card)
+            title_norm = _normalize(title) if title else ""
+            card_norm = _normalize(raw_text)
+            combined = f"{title_norm} {card_norm}"
 
-        def collect_candidates(enforce_model: bool) -> list[tuple[int, int, object, str, str, int, bool]]:
-            articles = self.page.locator("article").all()
-            candidates: list[tuple[int, int, object, str, str, int, bool]] = []
-            for idx, article in enumerate(articles):
-                try:
-                    text = article.inner_text().lower()
-                    title_text = self._extract_title_text(article)
-                    raw_title = title_text.lower() if title_text else ""
-                    title_norm = self._normalize_text(title_text) if title_text else ""
-                    card_norm = self._normalize_text(text)
-                    
-                    # Skip sponsored items
-                    if "gesponsert" in text or "anzeige" in text:
-                        continue
+            # Hard filters — always reject these
+            if _is_sponsored(raw_lower):
+                return None
 
-                    # Skip accessories unless the query explicitly asks for them
-                    if not self._query_allows_accessories(query_norm):
-                        accessories = {
-                            'hülle', 'huelle', 'case', 'cover', 'kabel', 'ladegerät', 'ladegeraet',
-                            'adapter', 'kopfhörer', 'kopfhoerer', 'displayschutz', 'folie',
-                            'schutzfolie', 'schutzglas', 'panzerglas', 'panzerfolie',
-                            'charger', 'earphone', 'earphones', 'tasche', 'pouch', 'bumper',
-                            'handyhülle', 'handyhuelle', 'schale', 'displayfolie', 'screen', 'protector',
-                            'schutzhülle', 'schutzhuelle',
-                            'akku', 'ersatzakku', 'battery', 'replacement', 'handyakku'
-                        }
-                        is_accessory = (
-                            any(acc in title_norm for acc in accessories)
-                            or any(acc in card_norm for acc in accessories)
-                            or any(acc in raw_title for acc in accessories)
-                            or any(acc in text for acc in accessories)
-                        )
-                        if is_accessory:
-                            continue
-                    
-                    # Enforce same model number (use full card text for reliability)
-                    model_match = False
-                    if model_number:
-                        model_match = self._matches_model_number_near_brand(card_norm, model_number)
-                    if enforce_model and model_number and not model_match:
-                        continue
-                    if enforce_model and model_number and self._has_conflicting_model_number(card_norm, model_number):
-                        continue
-                    
-                    # Require a minimal token overlap to avoid false positives
-                    if required_tokens and self._match_score_tokens(card_norm, required_tokens) < max(1, len(required_tokens) // 3):
-                        continue
+            if _is_accessory(title_norm, card_norm, raw_lower):
+                return None
 
-                    # Score by token overlap (title preferred, then card)
-                    score = self._match_score_tokens(title_norm or card_norm, required_tokens)
-                    if model_match:
-                        score += 5
-                    
-                    link = article.locator("a[href*='/p/']").first
-                    if link.count() > 0:
-                        candidates.append((score, idx, link, title_norm or card_norm, card_norm, score, model_match))
-                except Exception:
-                    continue
-            return candidates
+            if _is_wrong_category(combined, raw_lower, qi.brand):
+                return None
 
-        # Try several scroll passes to find the same model before giving up
-        for attempt in range(6):
-            candidates = collect_candidates(enforce_model=False)
-            if candidates:
-                model_candidates = [c for c in candidates if c[6]]
-                if model_candidates:
-                    candidates = model_candidates
-                candidates.sort(key=lambda x: (-x[0], x[1]))
-                _, idx, link, _, _, _, _ = candidates[0]
-                logger.info(f"Found product at position #{idx}")
-                BrowserHelper.random_mouse_move(self.page)
-                time.sleep(BrowserHelper.action_delay())
-                link.click()
-                try:
-                    self.page.wait_for_url("**/p/**", timeout=8000)
-                except:
-                    pass
-                self.page.wait_for_load_state("domcontentloaded")
-                time.sleep(BrowserHelper.action_delay())
-                logger.info(f"Product URL: {self.page.url}")
-                return True
-            # Scroll to load more results and retry
+            # Must have the product line (iphone/galaxy/pixel)
+            if qi.product_line and qi.product_line not in combined:
+                return None
+
+            # ---- Scoring ----
+            score = 0
+
+            # Token overlap
+            token_score = _match_score(combined, qi.search_tokens)
+            score += token_score * 2
+
+            # Brand
+            if qi.brand and qi.brand in combined:
+                score += 3
+
+            # Product line
+            if qi.product_line and qi.product_line in combined:
+                score += 3
+
+            # Model number near product line
+            if qi.model_number:
+                if self._model_near(combined, qi):
+                    score += 15
+                elif re.search(
+                    rf"\b{re.escape(qi.model_number)}\b", combined
+                ):
+                    score += 5
+                else:
+                    score -= 10  # Model not found
+
+                # Conflicting model
+                if self._conflicting_model(combined, qi):
+                    score -= 20
+
+            # Samsung sub-family (flip vs fold vs s)
+            if qi.samsung_sub:
+                if self._has_sub_family(combined, qi.samsung_sub):
+                    score += 10
+                else:
+                    score -= 15  # Wrong sub-family
+
+            # Variant matching
+            expected = set(qi.variant_tokens)
+            present = set()
+            for vt in VARIANT_TOKENS:
+                if re.search(rf"\b{re.escape(vt)}\b", combined):
+                    present.add(vt)
+
+            for vt in expected:
+                if vt in present:
+                    score += 8
+                else:
+                    score -= 10
+
+            for vt in present - expected:
+                score -= 8
+
+            # Category marker bonus
+            if any(w in combined for w in
+                   ["smartphone", "handy", "mobiltelefon"]):
+                score += 5
+
+            # Must have positive score
+            if score <= 0:
+                return None
+
+            link = card.locator("a[href*='/p/']").first
+            if link.count() == 0:
+                # Fallback: any link
+                link = card.locator("a").first
+                if link.count() == 0:
+                    return None
+
+            return (score, idx, link)
+
+        except Exception as e:
+            logger.debug(f"Card eval error: {e}")
+            return None
+
+    def _model_near(self, text: str, qi: QueryInfo) -> bool:
+        """Check if model number appears near product line or sub-family."""
+        tokens = text.split()
+
+        # For Samsung with sub-family, look after the sub-family token
+        if qi.samsung_sub:
+            for i, tok in enumerate(tokens):
+                if tok == qi.samsung_sub:
+                    window = tokens[i + 1: i + 4]
+                    if qi.model_number in window:
+                        return True
+            return False
+
+        # For other brands, look after the product line token
+        if qi.product_line:
+            for i, tok in enumerate(tokens):
+                if tok == qi.product_line or tok.startswith(qi.product_line):
+                    window = tokens[i + 1: i + 5]
+                    if qi.model_number in window:
+                        return True
+                    rem = tok.replace(qi.product_line, "", 1).strip()
+                    if rem == qi.model_number:
+                        return True
+        return False
+
+    def _conflicting_model(self, text: str, qi: QueryInfo) -> bool:
+        """Check for a different model number near the anchor token."""
+        tokens = text.split()
+        anchor = qi.samsung_sub or qi.product_line
+        if not anchor:
+            return False
+        for i, tok in enumerate(tokens):
+            if tok == anchor or tok.startswith(anchor):
+                window = tokens[i + 1: i + 5]
+                nums = [t for t in window if re.fullmatch(r"\d{1,2}", t)]
+                if nums and all(n != qi.model_number for n in nums):
+                    return True
+        return False
+
+    def _has_sub_family(self, text: str, sub: str) -> bool:
+        if sub in ("flip", "fold"):
+            return bool(re.search(
+                rf"galaxy\s+z\s+{re.escape(sub)}\b", text
+            ))
+        return bool(re.search(
+            rf"galaxy\s+{re.escape(sub)}\s*\d", text
+        ))
+
+    def _click_candidate(self, candidate: tuple) -> bool:
+        """Click on a scored candidate and navigate to product page."""
+        _, _, link = candidate
+        try:
+            BH.mouse_move(self.page)
+            time.sleep(BH.short_delay())
+            link.click()
             try:
-                self.page.mouse.wheel(0, 1200)
-                time.sleep(BrowserHelper.action_delay())
-            except:
+                self.page.wait_for_url("**/p/**", timeout=8000)
+            except Exception:
                 pass
-
-        logger.error("No suitable product found")
-        return False
-
-    def _normalize_text(self, text: str) -> str:
-        """Normalize text for token matching."""
-        text = text.lower()
-        text = re.sub(r"[^a-z0-9]+", " ", text)
-        return re.sub(r"\s+", " ", text).strip()
-
-    def _extract_model_number(self, query_norm: str) -> str:
-        """Extract model number like 16/17 from query."""
-        # Prefer numbers attached to a known brand (e.g., iphone16)
-        compact = re.sub(r"\s+", "", query_norm)
-        match = re.search(r"(iphone|ipad|galaxy|pixel)(\d{2})", compact)
-        if match:
-            return match.group(2)
-        # Fallback: standalone two-digit number
-        match = re.search(r"\b(\d{2})\b", query_norm)
-        if match:
-            return match.group(1)
-        return ""
-
-    def _variant_preference(self, query_norm: str) -> list[str]:
-        """Return preferred variants in order based on query."""
-        has_pro = "pro" in query_norm
-        has_max = "max" in query_norm
-        if has_pro and has_max:
-            return ["pro max", "pro", "max", "base"]
-        if has_pro:
-            return ["pro", "base"]
-        if has_max:
-            return ["max", "base"]
-        return ["base"]
-
-    def _matches_variant(self, title_norm: str, variant: str) -> bool:
-        """Check if title matches variant."""
-        if variant == "pro max":
-            return "pro" in title_norm and "max" in title_norm
-        if variant == "pro":
-            return "pro" in title_norm and "max" not in title_norm
-        if variant == "max":
-            return "max" in title_norm and "pro" not in title_norm
-        return ("pro" not in title_norm) and ("max" not in title_norm)
-
-    def _tokenize_query_loose(self, query_norm: str) -> list[str]:
-        """Tokenize query for loose matching (ignore storage/color/noise)."""
-        noise = {"gb", "tb", "speicher", "farbe", "schwarz", "weiß", "weiss", "silber", "rot", "blau", "gruen", "grün"}
-        return [t for t in query_norm.split() if t and t not in noise]
-
-    def _match_score_tokens(self, text_norm: str, query_tokens: list[str]) -> int:
-        """Score by overlap of query tokens with text."""
-        score = 0
-        for t in query_tokens:
-            if re.search(rf"\b{re.escape(t)}\b", text_norm):
-                score += 1
-        return score
-
-    def _query_allows_accessories(self, query_norm: str) -> bool:
-        """Return True if the query is explicitly for accessories."""
-        accessory_tokens = {
-            "hülle", "huelle", "case", "cover", "kabel", "ladegerät", "ladegeraet",
-            "adapter", "kopfhörer", "kopfhoerer", "earphone", "earphones", "charger",
-            "displayschutz", "folie", "schutzfolie", "tasche"
-        }
-        return any(tok in query_norm for tok in accessory_tokens)
-
-
-    def _has_conflicting_model_number(self, text_norm: str, model_number: str) -> bool:
-        """Return True if another two-digit model number appears near iPhone."""
-        tokens = text_norm.split()
-        if "iphone" not in tokens:
+            self.page.wait_for_load_state("domcontentloaded")
+            time.sleep(BH.short_delay())
+            logger.info(f"Product URL: {self.page.url}")
+            return True
+        except Exception as e:
+            logger.error(f"Click failed: {e}")
             return False
-        for i, tok in enumerate(tokens):
-            if tok != "iphone":
-                continue
-            window = tokens[i + 1 : i + 6]
-            found_models = [t for t in window if re.fullmatch(r"\d{2}", t)]
-            if found_models and any(m != model_number for m in found_models):
-                return True
-        return False
 
-    def _matches_model_number_near_brand(self, text_norm: str, model_number: str) -> bool:
-        """Match model number only when it appears next to the brand token (e.g., 'iphone 16')."""
-        tokens = text_norm.split()
-        if "iphone" not in tokens:
-            return False
-        for i, tok in enumerate(tokens):
-            if tok != "iphone":
-                continue
-            # Look ahead a few tokens for the model number
-            window = tokens[i + 1 : i + 5]
-            found_models = [t for t in window if re.fullmatch(r"\d{2}", t)]
-            if found_models:
-                return model_number in found_models
-        # Fallback: compact match like iphone16
-        compact = text_norm.replace(" ", "")
-        return re.search(rf"(iphone){re.escape(model_number)}", compact) is not None
-
-    def _has_model_number(self, text_norm: str, model_number: str) -> bool:
-        """Check if a specific model number appears anywhere."""
-        return re.search(rf"\b{re.escape(model_number)}\b", text_norm) is not None
-
-    def _title_has_other_models(self, title_norm: str, model_number: str) -> bool:
-        """Reject titles that contain a different two-digit model number."""
-        models = re.findall(r"\b(\d{2})\b", title_norm)
-        return any(m != model_number for m in models)
-
-    def _title_looks_like_phone(self, title_norm: str) -> bool:
-        """Filter out accessories by requiring phone-like keywords."""
-        return any(word in title_norm for word in ["smartphone", "handy", "mobiltelefon"])
-
-    def _extract_title_text(self, article) -> str:
-        """Extract product title text from search result article."""
+    # ------------------------------------------------------------------
+    # PDF extraction
+    # ------------------------------------------------------------------
+    def get_pdf_link(self) -> str:
         try:
-            link = article.locator("a[href*='/p/']").first
+            logger.info("Looking for Produktdatenblatt...")
+            time.sleep(BH.short_delay())
+
+            # JavaScript to check if element is in the main product area
+            # (not inside recommendation/alternative/sponsored sections)
+            is_main_product_js = """
+            (el) => {
+                let node = el;
+                while (node && node !== document.body) {
+                    const cls = (node.className || '').toLowerCase();
+                    const id = (node.id || '').toLowerCase();
+                    // Reject if inside recommendation/alternative sections
+                    if (cls.match(/reco|alternative|similar|suggest|passend|fittingly|interessant|sponsored|anzeige/)) {
+                        return false;
+                    }
+                    if (id.match(/reco|alternative|similar/)) {
+                        return false;
+                    }
+                    // Check headings inside this container
+                    if (node.tagName === 'SECTION' || node.tagName === 'DIV') {
+                        const h = node.querySelector('h2, h3, h4');
+                        if (h) {
+                            const ht = h.textContent.toLowerCase();
+                            if (ht.includes('alternative') || ht.includes('passend') ||
+                                ht.includes('interessant') || ht.includes('interesting') ||
+                                ht.includes('ähnlich') || ht.includes('similar') ||
+                                ht.includes('fittingly') || ht.includes('zubehör')) {
+                                return false;
+                            }
+                        }
+                    }
+                    node = node.parentElement;
+                }
+                return true;
+            }
+            """
+
+            # Method 1: Find Produktdatenblatt links, skip ones in reco sections
+            for label in ["Produktdatenblatt", "Product data sheet",
+                          "product data sheet"]:
+                links = self.page.locator(f"a:has-text('{label}')").all()
+                for link in links:
+                    try:
+                        in_main = link.evaluate(is_main_product_js)
+                        if not in_main:
+                            logger.info(f"Skipping PDF link in recommendation section")
+                            continue
+                        href = link.get_attribute("href")
+                        if href and ".pdf" in href.lower():
+                            logger.info(f"Found PDF: {href}")
+                            return href
+                    except Exception:
+                        continue
+
+            # Method 2: Click-based fallback, also checking parent
+            for label in ["Produktdatenblatt", "Product data sheet"]:
+                elements = self.page.get_by_text(label).all()
+                for el in elements:
+                    try:
+                        in_main = el.evaluate(is_main_product_js)
+                        if not in_main:
+                            continue
+
+                        href = el.get_attribute("href")
+                        if href and ".pdf" in href.lower():
+                            logger.info(f"Found PDF: {href}")
+                            return href
+
+                        el.scroll_into_view_if_needed()
+                        BH.scroll(self.page)
+                        time.sleep(BH.short_delay())
+                        el.click(timeout=3000)
+                        time.sleep(random.uniform(0.8, 1.6))
+
+                        pdf_links = self.page.locator(
+                            "a[href*='d.otto.de'][href*='.pdf']"
+                        ).all()
+                        for pl in pdf_links:
+                            try:
+                                in_main2 = pl.evaluate(is_main_product_js)
+                                if not in_main2:
+                                    continue
+                            except Exception:
+                                pass
+                            href = pl.get_attribute("href")
+                            if href:
+                                logger.info(f"Found PDF: {href}")
+                                return href
+                    except Exception as e:
+                        logger.debug(f"PDF click error: {e}")
+
+            logger.warning("PDF not found")
+            return "Not found"
+        except Exception as e:
+            logger.error(f"PDF error: {e}")
+            return "Not found"
+
+    def _extract_title(self, card) -> str:
+        try:
+            link = card.locator("a[href*='/p/']").first
             if link.count() > 0:
                 aria = link.get_attribute("aria-label")
                 if aria:
@@ -430,588 +804,922 @@ class OttoNavigator:
                 text = link.inner_text()
                 if text:
                     return text
-        except:
+        except Exception:
             pass
         try:
-            heading = article.locator("h2, h3").first
+            heading = card.locator("h2, h3, h4").first
             if heading.count() > 0:
                 return heading.inner_text()
-        except:
+        except Exception:
             pass
         return ""
-    
-    def get_pdf_link(self) -> str:
-        """Extract PDF link from Produktdatenblatt section"""
+
+    # ------------------------------------------------------------------
+    # ENERGY SECTION — scroll to it and expand it
+    # ------------------------------------------------------------------
+    def _scroll_to_energy_section(self):
+        """Scroll down to find and expand the energy label section.
+        The pdp_eek section may be collapsed — we need to click on
+        the energy label to reveal the sheet image.
+        """
+        # First scroll down to find the energy section
+        for _ in range(8):
+            try:
+                el = self.page.locator("[class*='pdp_eek']").first
+                if el.count() > 0 and el.is_visible():
+                    el.scroll_into_view_if_needed()
+                    time.sleep(0.3)
+                    break
+            except Exception:
+                pass
+            BH.scroll(self.page, 600)
+            time.sleep(0.2)
+
+        # Click on the energy label to expand the sheet image
+        # The label area is clickable and reveals the full energy sheet
+        for click_sel in [
+            ".pdp_eek__label",
+            "[class*='pdp_eek__label']",
+            ".js_openInPaliSheet",
+            "img.pdp_eek__label-img",
+            "[class*='pdp_eek'] [class*='label']",
+        ]:
+            try:
+                el = self.page.locator(click_sel).first
+                if el.count() > 0 and el.is_visible():
+                    el.click(timeout=3000)
+                    time.sleep(0.5)
+                    logger.info(f"Clicked energy label: {click_sel}")
+                    break
+            except Exception:
+                continue
+
+    # ------------------------------------------------------------------
+    # ENERGY CLASS — from product page DOM
+    # ------------------------------------------------------------------
+    def get_energy_class_from_page(self) -> str:
+        """Extract energy class from img.pdp_eek__label-img alt attribute."""
+        logger.info("Extracting energy class from page...")
+
+        # Scroll to the energy section first
+        self._scroll_to_energy_section()
+
+        # Method 1: img.pdp_eek__label-img alt="A"
         try:
-            logger.info("Looking for product datasheet (Produktdatenblatt)...")
-            time.sleep(BrowserHelper.action_delay())
-            
-            # Prefer href extraction to avoid opening new tabs
-            link = self.page.locator("a:has-text('Produktdatenblatt')").first
-            if link.count() > 0:
-                href = link.get_attribute("href")
-                if href and ".pdf" in href.lower():
-                    logger.info(f"Found PDF (direct link): {href}")
-                    return href
-            
-            # Find and click datasheet link (fallback)
-            elements = self.page.get_by_text("Produktdatenblatt").all()
-            
-            for element in elements:
+            el = self.page.locator("img.pdp_eek__label-img").first
+            if el.count() > 0:
+                alt = (el.get_attribute("alt") or "").strip()
+                if re.fullmatch(r"[A-G][+]{0,3}", alt):
+                    logger.info(f"Energy class from page: {alt}")
+                    return alt
+                src = el.get_attribute("src") or ""
+                m = re.search(r"pl_eek_([a-g])", src, re.I)
+                if m:
+                    logger.info(f"Energy class from src: {m.group(1).upper()}")
+                    return m.group(1).upper()
+        except Exception:
+            pass
+
+        # Method 2: Text inside pdp_eek container
+        try:
+            el = self.page.locator("[class*='pdp_eek']").first
+            if el.count() > 0:
+                text = el.inner_text().strip()
+                m = re.search(r"\b([A-G])\+{0,3}\b", text)
+                if m:
+                    logger.info(f"Energy class from eek text: {m.group(0)}")
+                    return m.group(0)
+        except Exception:
+            pass
+
+        # Method 3: Any img with src containing pl_eek
+        try:
+            imgs = self.page.locator("img[src*='pl_eek']").all()
+            for img in imgs:
+                src = img.get_attribute("src") or ""
+                m = re.search(r"pl_eek_([a-g])", src, re.I)
+                if m:
+                    logger.info(f"Energy class from img src: {m.group(1).upper()}")
+                    return m.group(1).upper()
+                alt = (img.get_attribute("alt") or "").strip()
+                if re.fullmatch(r"[A-G][+]{0,3}", alt):
+                    return alt
+        except Exception:
+            pass
+
+        logger.info("Energy class not found on page")
+        return ""
+
+    # ------------------------------------------------------------------
+    # ENERGY LEVEL IMAGE LINK — from product page DOM
+    # ------------------------------------------------------------------
+    def get_energy_image_link(self) -> str:
+        """Extract energy label sheet image URL.
+
+        From the DOM (after clicking/expanding):
+        <img class="pdp_eek__sheet-image"
+             srcset="https://i.otto.de/i/otto/fcc7cb20-3284-57f6-9823-47e55dfcfbe8 2x"
+             src="https://i.otto.de/i/otto/fcc7cb20-3284-57f6-9823-47e55dfcfbe8">
+
+        We want the URL from srcset (without the "2x" part).
+        """
+        logger.info("Extracting energy label image link...")
+
+        # The energy section should already be scrolled to and expanded
+        # by get_energy_class_from_page() which runs before this
+
+        # Method 1: img.pdp_eek__sheet-image — exact class from user's DOM
+        try:
+            el = self.page.locator("img.pdp_eek__sheet-image").first
+            if el.count() > 0:
+                srcset = el.get_attribute("srcset") or ""
+                if srcset:
+                    # srcset="https://i.otto.de/i/otto/xxx 2x" — take URL part
+                    url = srcset.split()[0].strip()
+                    if url.startswith("http"):
+                        logger.info(f"Energy image from srcset: {url}")
+                        return url
+                src = el.get_attribute("src") or ""
+                if src.startswith("http"):
+                    logger.info(f"Energy image from src: {src}")
+                    return src
+        except Exception:
+            pass
+
+        # Method 2: Any img inside pdp_eek__sheet-image-container
+        try:
+            el = self.page.locator(".pdp_eek__sheet-image-container img").first
+            if el.count() > 0:
+                srcset = el.get_attribute("srcset") or ""
+                if srcset:
+                    url = srcset.split()[0].strip()
+                    if url.startswith("http"):
+                        logger.info(f"Energy image from container: {url}")
+                        return url
+                src = el.get_attribute("src") or ""
+                if src.startswith("http"):
+                    return src
+        except Exception:
+            pass
+
+        # Method 3: Try using JavaScript to find the image in shadow DOM or lazy-loaded
+        try:
+            url = self.page.evaluate("""
+                () => {
+                    const img = document.querySelector('img.pdp_eek__sheet-image');
+                    if (img) {
+                        return img.srcset ? img.srcset.split(' ')[0] : img.src;
+                    }
+                    const container = document.querySelector('[class*="pdp_eek__sheet"]');
+                    if (container) {
+                        const innerImg = container.querySelector('img');
+                        if (innerImg) {
+                            return innerImg.srcset ? innerImg.srcset.split(' ')[0] : innerImg.src;
+                        }
+                    }
+                    // Search all images for otto.de energy label URLs
+                    const allImgs = document.querySelectorAll('img[srcset*="i.otto.de"]');
+                    for (const i of allImgs) {
+                        const parent = i.closest('[class*="pdp_eek"]');
+                        if (parent) {
+                            return i.srcset ? i.srcset.split(' ')[0] : i.src;
+                        }
+                    }
+                    return null;
+                }
+            """)
+            if url and url.startswith("http"):
+                logger.info(f"Energy image from JS: {url}")
+                return url
+        except Exception:
+            pass
+
+        # Method 4: Wait a bit more and retry (lazy loading)
+        try:
+            time.sleep(1.0)
+            el = self.page.locator("img.pdp_eek__sheet-image").first
+            if el.count() > 0:
+                srcset = el.get_attribute("srcset") or ""
+                if srcset:
+                    url = srcset.split()[0].strip()
+                    if url.startswith("http"):
+                        logger.info(f"Energy image (retry): {url}")
+                        return url
+                src = el.get_attribute("src") or ""
+                if src.startswith("http"):
+                    return src
+        except Exception:
+            pass
+
+        logger.info("Energy image link not found")
+        return "Not found"
+
+    # ------------------------------------------------------------------
+    # SUPPLIER — from "Details on product safety" popup
+    # ------------------------------------------------------------------
+    def get_supplier_from_page(self) -> str:
+        """Click 'Details zur Produktsicherheit' / 'Details on product safety'
+        and extract supplier info from the popup that opens."""
+        logger.info("Getting supplier from product safety popup...")
+
+        # Step 1: Scroll down to Important Information section
+        for _ in range(5):
+            try:
+                for marker in ["Wichtige Informationen",
+                               "Important information"]:
+                    el = self.page.get_by_text(marker, exact=False).first
+                    if el.count() > 0 and el.is_visible():
+                        el.scroll_into_view_if_needed()
+                        break
+                break
+            except Exception:
+                pass
+            BH.scroll(self.page, 800)
+            time.sleep(0.2)
+
+        # Step 2: Click the product safety link
+        clicked = False
+        click_labels = [
+            "Details zur Produktsicherheit",
+            "Details on product safety",
+            "Angaben zur Produktsicherheit",
+            "Product safety details",
+            "Produktsicherheit",
+        ]
+        for label in click_labels:
+            if clicked:
+                break
+            try:
+                el = self.page.get_by_text(label, exact=False).first
+                if el.count() > 0:
+                    el.scroll_into_view_if_needed()
+                    time.sleep(0.15)
+                    el.click(timeout=5000)
+                    time.sleep(0.8)
+                    clicked = True
+                    logger.info(f"Clicked: {label}")
+                    break
+            except Exception:
+                pass
+
+        if not clicked:
+            logger.info("Product safety link not found")
+            return ""
+
+        # Step 3: Extract text from popup/side panel
+        supplier_text = ""
+        try:
+            time.sleep(0.5)
+            popup_text = ""
+
+            for sel in ["[role='dialog']", "[aria-modal='true']",
+                        "[class*='modal']", "[class*='Modal']",
+                        "[class*='dialog']", "[class*='Dialog']",
+                        "[class*='overlay']", "[class*='Overlay']",
+                        "[class*='slide']", "[class*='panel']",
+                        "[class*='drawer']", "[class*='Drawer']"]:
                 try:
-                    # If the element is already a link to PDF, grab it without clicking
-                    href = element.get_attribute("href")
-                    if href and ".pdf" in href.lower():
-                        logger.info(f"Found PDF (direct link): {href}")
-                        return href
-                    
-                    element.scroll_into_view_if_needed()
-                    BrowserHelper.random_scroll(self.page)
-                    time.sleep(BrowserHelper.action_delay())
-                    element.click(timeout=3000)
-                    logger.info("Clicked datasheet link")
-                    time.sleep(random.uniform(0.8, 1.6))
-                    
-                    # Look for PDF link in page
-                    pdf_links = self.page.locator("a[href*='d.otto.de'][href*='.pdf']").all()
-                    
-                    if pdf_links:
-                        href = pdf_links[0].get_attribute("href")
-                        if href:
-                            logger.info(f"Found PDF: {href}")
-                            return href
-                    
-                except Exception as e:
-                    logger.debug(f"Error processing element: {e}")
-            
-            logger.warning("PDF not found")
-            return "Not found"
-            
+                    els = self.page.locator(sel).all()
+                    for el in els:
+                        if el.is_visible():
+                            text = el.inner_text()
+                            tl = text.lower()
+                            if ("responsible" in tl or "verantwortlich" in tl
+                                    or "wirtschaftsakteur" in tl
+                                    or "economic operator" in tl):
+                                popup_text = text
+                                break
+                    if popup_text:
+                        break
+                except Exception:
+                    continue
+
+            if not popup_text:
+                try:
+                    popup_text = self.page.inner_text("body")
+                except Exception:
+                    pass
+
+            if popup_text:
+                supplier_text = self._parse_supplier_popup(popup_text)
+
         except Exception as e:
-            logger.error(f"Error extracting PDF link: {e}")
-            return "Not found"
+            logger.debug(f"Popup extraction error: {e}")
+
+        # Step 4: Close popup
+        try:
+            for close_sel in [
+                "button[aria-label='Close']",
+                "button[aria-label='Schließen']",
+                "button[aria-label='close']",
+            ]:
+                btn = self.page.locator(close_sel).first
+                if btn.count() > 0 and btn.is_visible():
+                    btn.click(timeout=2000)
+                    time.sleep(0.2)
+                    break
+            else:
+                self.page.keyboard.press("Escape")
+                time.sleep(0.2)
+        except Exception:
+            try:
+                self.page.keyboard.press("Escape")
+                time.sleep(0.2)
+            except Exception:
+                pass
+
+        if supplier_text:
+            logger.info(f"Supplier from page: {supplier_text[:80]}...")
+        else:
+            logger.info("Supplier not found in popup")
+        return supplier_text
+
+    @staticmethod
+    def _parse_supplier_popup(text: str) -> str:
+        """Parse supplier info from product safety popup text."""
+        if not text:
+            return ""
+
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+        start_markers = [
+            "located in the eu",
+            "in der eu befindet",
+            "in der eu angesiedelt",
+            "the economic operator responsible",
+            "der wirtschaftsakteur",
+            "verantwortliche person",
+            "responsible person for the eu",
+        ]
+
+        start_idx = -1
+        for i, line in enumerate(lines):
+            ll = line.lower()
+            if any(m in ll for m in start_markers):
+                start_idx = i
+                break
+
+        if start_idx == -1:
+            return ""
+
+        collected = []
+        stop_markers = [
+            "you can also find", "sie finden", "sie können",
+            "important information", "wichtige informationen",
+            "report legal", "rechtliche bedenken",
+            "return instruction", "rücksendeh",
+            "disposal instruction", "entsorgungsh",
+            "details on product", "details zur produkt",
+            "discover another", "entdecke",
+            "interesting alternative", "interessante alternative",
+            "purchase on account", "kauf auf rechnung",
+            "30-day", "30 tage",
+            "https://", "http://",
+            "attention:", "achtung:",
+        ]
+
+        for i in range(start_idx + 1, min(start_idx + 7, len(lines))):
+            ll = lines[i].lower()
+            if any(s in ll for s in stop_markers):
+                break
+            if any(m in ll for m in start_markers):
+                continue
+            if len(lines[i]) < 3 or len(lines[i]) > 200:
+                continue
+            if lines[i] in ("×", "X", "Close", "Schließen", "OK"):
+                continue
+            collected.append(lines[i])
+
+        if collected:
+            return re.sub(r"\s+", " ", " ".join(collected)).strip()
+        return ""
+# ============================================================================
+
+class PDFExtractor:
+    def __init__(self, config: Config):
+        self.config = config
+
+    def extract_fields(self, pdf_url: str,
+                       expected_brand: Optional[str] = None
+                       ) -> Tuple[str, str]:
+        if not pdf_url or pdf_url == "Not found":
+            return ("Not found", "Not found")
+
+        pdf_bytes = self._fetch(pdf_url)
+        if not pdf_bytes:
+            return ("Not found", "Not found")
+
+        pages = self._text_pages(pdf_bytes) or []
+
+        # Brand validation
+        if expected_brand and pages:
+            full = " ".join(pages).lower()
+            tokens = [expected_brand]
+            if expected_brand in BRAND_FAMILIES:
+                tokens += BRAND_FAMILIES[expected_brand]["product_lines"]
+            if not any(t in full for t in tokens):
+                logger.warning(f"PDF brand mismatch: expected '{expected_brand}'")
+                return ("Not found", "Not found")
+
+        energy = ""
+        supplier = ""
+
+        if len(pages) >= 6:
+            energy = self._energy([pages[5]])
+        if not energy:
+            energy = self._energy(pages)
+
+        if len(pages) >= 25:
+            supplier = self._supplier([pages[24]])
+        if not supplier:
+            supplier = self._supplier(pages)
+
+        if self.config.OCR_ENABLED and (not energy or not supplier):
+            ocr = self._ocr_pages(pdf_bytes)
+            if ocr:
+                if not energy:
+                    energy = self._energy(ocr)
+                if not supplier:
+                    supplier = self._supplier(ocr)
+
+        return (energy or "Not found", supplier or "Not found")
+
+    def _fetch(self, url: str) -> Optional[bytes]:
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/pdf",
+            })
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return r.read()
+        except Exception as e:
+            logger.warning(f"PDF fetch failed: {e}")
+            return None
+
+    def _text_pages(self, data: bytes) -> list[str]:
+        try:
+            import pdfplumber
+            with pdfplumber.open(io.BytesIO(data)) as pdf:
+                return [p.extract_text() or "" for p in pdf.pages]
+        except Exception:
+            try:
+                from PyPDF2 import PdfReader
+                reader = PdfReader(io.BytesIO(data))
+                return [(p.extract_text() or "") for p in reader.pages]
+            except Exception as e:
+                logger.warning(f"PDF parse failed: {e}")
+                return []
+
+    def _ocr_pages(self, data: bytes) -> list[str]:
+        try:
+            from pdf2image import convert_from_bytes, pdfinfo_from_bytes
+            import pytesseract
+        except Exception:
+            return []
+        try:
+            info = pdfinfo_from_bytes(data,
+                                      poppler_path=self.config.POPPLER_PATH)
+            pc = int(info.get("Pages", 0))
+        except Exception:
+            pc = 0
+        pns = ([6, 25] if pc >= 25 else [6] if pc >= 6
+               else list(range(1, pc + 1)) if pc > 0 else [1])
+        out: list[str] = []
+        for pn in pns:
+            try:
+                imgs = convert_from_bytes(
+                    data, dpi=self.config.OCR_DPI, fmt="png",
+                    first_page=pn, last_page=pn,
+                    poppler_path=self.config.POPPLER_PATH)
+                if imgs:
+                    pytesseract.pytesseract.tesseract_cmd = self.config.TESSERACT_CMD
+                    try:
+                        t = pytesseract.image_to_string(
+                            imgs[0], lang=self.config.OCR_LANG) or ""
+                    except Exception:
+                        t = pytesseract.image_to_string(
+                            imgs[0], lang="eng") or ""
+                    out.append(t)
+            except Exception as e:
+                logger.warning(f"OCR page {pn}: {e}")
+        return out
+
+    def _energy(self, pages: list[str]) -> str:
+        for text in pages:
+            if not text:
+                continue
+            m = re.search(
+                r"(?:Energy\s*efficiency\s*class|Energieeffizienzklasse)"
+                r"\s*[:\-]?\s*([A-G](?:\s*[+]){0,3})", text, re.I)
+            if m:
+                return m.group(1).replace(" ", "")
+            v = self._labeled(text,
+                              ["Energy efficiency class",
+                               "Energieeffizienzklasse"],
+                              r"[A-G][+]{0,3}")
+            if v:
+                return v
+            for i, line in enumerate(text.splitlines()):
+                ll = line.lower()
+                if "energieeffizienz" in ll or "energy efficiency" in ll:
+                    s = line + (" " + text.splitlines()[i + 1]
+                                if i + 1 < len(text.splitlines()) else "")
+                    m2 = re.search(r"\b([A-G])\b", s)
+                    if m2:
+                        return m2.group(1)
+        return ""
+
+    def _supplier(self, pages: list[str]) -> str:
+        la = ["Supplier information", "Lieferanteninformation",
+              "Anschrift des Lieferanten",
+              "Supplier's address", "Supplier address"]
+        lb = ["Supplier's address", "Supplier address",
+              "Lieferant", "Supplier"]
+        for text in pages:
+            if not text:
+                continue
+            for method in [
+                lambda: self._inline_after(text,
+                                           ["Anschrift des Lieferanten"]),
+                lambda: self._supplier_address_table(text),
+                lambda: self._block_after(text, la, 5),
+                lambda: self._block_after_phrases(text, [
+                    "Minimum duration of the guarantee offered by the supplier",
+                    "Mindestdauer der vom Lieferanten angebotenen Garantie",
+                ], 5),
+                lambda: self._block_before(text, lb, 4),
+                lambda: self._labeled(text, la + lb),
+            ]:
+                val = method()
+                if val and self._valid_supplier(val):
+                    return self._clean_supplier(val)
+        return ""
+
+    def _supplier_address_table(self, text: str) -> str:
+        """Handle Apple-style PDFs where 'Supplier's address (a) (b) (g)'
+        is followed by the company name on the same or next lines.
+        Example from Apple PDF:
+          Supplier's address (a) (b) (g)  Apple Distribution International Limited
+                                           Hollyhill Industrial Estate
+                                           T23 YK84 Cork Ireland
+        """
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        lls = [l.lower() for l in lines]
+
+        for i, ll in enumerate(lls):
+            if "supplier" in ll and "address" in ll:
+                # Check if value is on the same line after annotation markers
+                # e.g., "Supplier's address (a) (b) (g) Apple Distribution..."
+                m = re.search(
+                    r"supplier'?s?\s*address\s*(?:\([a-z]\)\s*)*(.+)",
+                    lines[i], re.I)
+                if m:
+                    val = m.group(1).strip()
+                    if val and len(val) > 5 and not val.startswith("("):
+                        # Collect multi-line address
+                        collected = [val]
+                        for j in range(i + 1, min(i + 5, len(lines))):
+                            if self._heading(lines[j]):
+                                break
+                            if re.match(r"^\(", lines[j]):
+                                break
+                            if len(lines[j]) < 3:
+                                break
+                            collected.append(lines[j])
+                        return " ".join(collected)
+
+                # Value is on next lines
+                collected = []
+                for j in range(i + 1, min(i + 5, len(lines))):
+                    if self._heading(lines[j]):
+                        break
+                    if re.match(r"^\([a-z]\)\s", lines[j]):
+                        break
+                    if self._annot(lines[j]):
+                        continue
+                    collected.append(lines[j])
+                if collected:
+                    return " ".join(collected)
+        return ""
+
+    @staticmethod
+    def _valid_supplier(v: str) -> bool:
+        if not v or len(v.strip()) < 5:
+            return False
+        lo = v.lower()
+        for g in ["steuern", "weitere angaben", "self-repair",
+                   "spare-parts", "search-detail"]:
+            if g in lo:
+                return False
+        return sum(1 for c in v if c.isalpha()) >= 5
+
+    @staticmethod
+    def _clean_supplier(v: str) -> str:
+        t = v.strip().replace("\u2019", "'")
+        t = re.sub(r"^(\s*\([a-z]\)\s*)+", "", t, flags=re.I)
+        t = re.sub(
+            r"^(?:supplier information|lieferanteninformation"
+            r"|anschrift des lieferanten|supplier'?s? address)\s*",
+            "", t, flags=re.I)
+        t = re.sub(r"\bsupplier\s*'?s?\s*address.*$", "", t, flags=re.I)
+        t = re.sub(r"\banschrift des lieferanten.*$", "", t, flags=re.I)
+        t = re.sub(r"\s*(\([a-z]\)\s*)+\s*$", "", t, flags=re.I)
+        for mk in ["Produktdatenblatt", "Product information sheet",
+                    "Additional information", "Angaben zur Reparierbarkeit"]:
+            i = t.lower().find(mk.lower())
+            if i != -1:
+                t = t[:i].strip()
+        t = re.sub(r"\d{1,2}\.\s+.+$", "", t).strip()
+        t = re.sub(r"([a-z])([A-Z])", r"\1 \2", t)
+        t = re.sub(r"([A-Za-z])(\d)", r"\1 \2", t)
+        t = re.sub(r"(\d)([A-Za-z])", r"\1 \2", t)
+        t = re.sub(r"https?://\S+", "", t)
+        t = re.sub(r"\bSteuern\b.*$", "", t, flags=re.I)
+        t = re.sub(r"\bWeitere Angaben\b.*$", "", t, flags=re.I)
+        return re.sub(r"\s+", " ", t).strip()
+
+    def _labeled(self, text: str, labels: list[str],
+                 vre: Optional[str] = None) -> str:
+        if not text:
+            return ""
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        lls = [l.lower() for l in lines]
+        for lb in labels:
+            ll = lb.lower()
+            for i, line in enumerate(lls):
+                if ll in line:
+                    m = re.search(rf"{re.escape(lb)}\s*[:\-]?\s*(.+)",
+                                  lines[i], re.I)
+                    if m and m.group(1).strip():
+                        c = m.group(1).strip()
+                        if vre:
+                            vm = re.search(vre, c)
+                            return vm.group(0) if vm else ""
+                        return c
+                    if i + 1 < len(lines):
+                        c = lines[i + 1].strip()
+                        if vre:
+                            vm = re.search(vre, c)
+                            return vm.group(0) if vm else ""
+                        return c
+        return ""
+
+    def _inline_after(self, text: str, labels: list[str]) -> str:
+        for lb in labels:
+            pat = r"\s+".join(map(re.escape, lb.split()))
+            m = re.search(rf"{pat}\s*(?:\([a-z]\)\s*)*:?\s*(.+)",
+                          text, re.I | re.S)
+            if m:
+                return m.group(1).strip()
+        return ""
+
+    def _block_after(self, text: str, labels: list[str],
+                     ml: int = 4) -> str:
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        lls = [l.lower() for l in lines]
+        for lb in labels:
+            ll = lb.lower()
+            for i, line in enumerate(lls):
+                if ll in line:
+                    c = []
+                    for j in range(i + 1, min(i + 1 + ml, len(lines))):
+                        if re.match(r"^\([a-z]\)\s*$", lines[j], re.I):
+                            break
+                        if re.match(r"^\d+\.", lines[j]):
+                            break
+                        if lines[j].startswith("("):
+                            break
+                        if self._heading(lines[j]):
+                            break
+                        if self._annot(lines[j]):
+                            continue
+                        c.append(lines[j])
+                    if c:
+                        return " ".join(c)
+        return ""
+
+    def _block_after_phrases(self, text: str, phrases: list[str],
+                             ml: int = 4) -> str:
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        lls = [l.lower() for l in lines]
+        for ph in phrases:
+            pl = ph.lower()
+            for i, line in enumerate(lls):
+                if pl in line:
+                    c = []
+                    for j in range(i + 1, min(i + 1 + ml, len(lines))):
+                        if re.match(r"^\d+\.", lines[j]):
+                            break
+                        if lines[j].startswith("("):
+                            break
+                        if self._heading(lines[j]):
+                            break
+                        if self._annot(lines[j]):
+                            continue
+                        c.append(lines[j])
+                    if c:
+                        return " ".join(c)
+        return ""
+
+    def _block_before(self, text: str, labels: list[str],
+                      ml: int = 4) -> str:
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        lls = [l.lower() for l in lines]
+        for lb in labels:
+            ll = lb.lower()
+            for i, line in enumerate(lls):
+                if ll in line:
+                    c = []
+                    for j in range(i - 1, max(-1, i - 1 - ml), -1):
+                        if re.match(r"^\d+\.", lines[j]):
+                            break
+                        if self._heading(lines[j]):
+                            break
+                        if self._annot(lines[j]):
+                            continue
+                        c.append(lines[j])
+                    if c:
+                        return " ".join(reversed(c))
+        return ""
+
+    @staticmethod
+    def _annot(t: str) -> bool:
+        s = t.strip()
+        return (not s or len(s) <= 2
+                or bool(re.fullmatch(r"(\([a-z]\)\s*)+", s, re.I)))
+
+    @staticmethod
+    def _heading(t: str) -> bool:
+        lo = t.lower()
+        return any(h in lo for h in [
+            "product information sheet", "produktdatenblatt",
+            "additional information", "repairability",
+            "angaben zur reparierbarkeit"])
 
 
 # ============================================================================
-# MAIN SCRAPER
+# SCRAPER
 # ============================================================================
 
 class Scraper:
-    """Main scraper orchestrator"""
-    
     def __init__(self):
         self.config = Config()
-    
+        self.pdf = PDFExtractor(self.config)
+
     def load_queries(self) -> list[str]:
-        """Load search queries from input file"""
-        path = Path(self.config.INPUT_FILE)
-        
-        if not path.exists():
-            raise FileNotFoundError(f"Input file not found: {self.config.INPUT_FILE}")
-        
-        queries = [line.strip() for line in path.read_text(encoding="utf-8").split('\n') if line.strip()]
-        
-        if not queries:
-            raise ValueError("Input file is empty")
-        
-        logger.info(f"Loaded {len(queries)} queries")
-        return queries
-    
-    def scrape_product(self, navigator: OttoNavigator, query: str) -> Optional[ProductData]:
-        """Scrape product data"""
+        p = Path(self.config.INPUT_FILE)
+        if not p.exists():
+            raise FileNotFoundError(f"Not found: {self.config.INPUT_FILE}")
+        qs = [l.strip() for l in p.read_text(encoding="utf-8").split("\n")
+              if l.strip()]
+        if not qs:
+            raise ValueError("Empty input")
+        logger.info(f"Loaded {len(qs)} queries")
+        return qs
+
+    def scrape(self, nav: OttoNavigator, query: str) -> Optional[ProductData]:
         try:
-            # Search and navigate
-            navigator.search_product(query)
-            
-            if not navigator.find_product(query):
+            nav.search_product(query)
+            if not nav.find_product(query):
                 return None
-            
-            product_url = navigator.page.url
-            pdf_link = navigator.get_pdf_link()
-            energy_class, supplier_info = self.extract_pdf_fields(pdf_link)
-            
-            # Create result
-            result = ProductData(
-                input_ean=query,
-                product_url=product_url,
-                pdf_link=pdf_link,
-                energy_efficiency_class=energy_class,
-                supplier_information=supplier_info
+
+            url = nav.page.url
+            brand = _detect_brand(_normalize(query))
+
+            # Energy class from page DOM
+            energy = nav.get_energy_class_from_page()
+
+            # Energy level image link from page DOM
+            energy_img = nav.get_energy_image_link()
+
+            # Supplier from "Details zur Produktsicherheit" popup
+            supplier = nav.get_supplier_from_page()
+
+            # PDF link + PDF fallback (with brand validation)
+            pdf = nav.get_pdf_link()
+            pdf_energy, pdf_supplier = self.pdf.extract_fields(pdf, brand)
+
+            # Use PDF data only as fallback
+            if not energy and pdf_energy and pdf_energy != "Not found":
+                energy = pdf_energy
+            if not supplier and pdf_supplier and pdf_supplier != "Not found":
+                supplier = pdf_supplier
+
+            return ProductData(
+                query, url, pdf,
+                energy if energy else "Not found",
+                energy_img if energy_img else "Not found",
+                supplier if supplier else "Not found",
             )
-            
-            logger.info(f"✓ Scraped: {query}")
-            return result
-            
         except Exception as e:
-            logger.error(f"Error scraping {query}: {e}")
+            logger.error(f"Error: {query}: {e}")
             return None
-    
-    def run(self) -> None:
-        """Execute scraping workflow"""
+
+    def run(self):
         queries = self.load_queries()
-        
+        results: list[dict] = []
+
+        fields = ["input_ean", "product_url", "pdf_link",
+                  "energy_efficiency_class", "energylevel_link",
+                  "supplier_information"]
+
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=self.config.HEADLESS,
-                slow_mo=self.config.SLOW_MO
-            )
-            
-            context = browser.new_context(
-                viewport={
-                    "width": self.config.VIEWPORT_WIDTH,
-                    "height": self.config.VIEWPORT_HEIGHT
-                },
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                accept_downloads=False
-            )
-            page = context.new_page()
-            page.route("**/*.pdf", lambda route: route.abort())
-            page.on("popup", lambda popup: popup.close())
+                slow_mo=self.config.SLOW_MO)
+            ctx = browser.new_context(
+                viewport={"width": self.config.VIEWPORT_WIDTH,
+                          "height": self.config.VIEWPORT_HEIGHT},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36",
+                accept_downloads=False)
+            page = ctx.new_page()
+            page.route("**/*.pdf", lambda r: r.abort())
+            page.on("popup", lambda p: p.close())
             page.set_default_timeout(self.config.DEFAULT_TIMEOUT_MS)
             page.set_default_navigation_timeout(self.config.DEFAULT_TIMEOUT_MS)
-            navigator = OttoNavigator(page)
-            
-            # Write CSV
-            fieldnames = [
-                "input_ean",
-                "product_url",
-                "pdf_link",
-                "energy_efficiency_class",
-                "supplier_information"
-            ]
-            
-            with open(self.config.OUTPUT_FILE, "w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-                
-                for i, query in enumerate(queries, 1):
-                    logger.info(f"\n{'='*60}")
-                    logger.info(f"Processing [{i}/{len(queries)}]: {query}")
-                    logger.info(f"{'='*60}")
-                    
-                    product = self.scrape_product(navigator, query)
-                    
-                    if product:
-                        writer.writerow(asdict(product))
-                        f.flush()
-                    else:
-                        # Record the query even when no product is found
-                        writer.writerow({
-                            "input_ean": query,
-                            "product_url": "",
-                            "pdf_link": "",
-                            "energy_efficiency_class": "",
-                            "supplier_information": ""
-                        })
-                        f.flush()
-                    
-                    # Delay before next product
-                    if i < len(queries):
-                        delay = BrowserHelper.human_delay()
-                        logger.info(f"Waiting {delay:.1f}s before next search...")
-                        time.sleep(delay)
-            
+            nav = OttoNavigator(page)
+
+            for i, q in enumerate(queries, 1):
+                logger.info(f"\n{'=' * 60}")
+                logger.info(f"[{i}/{len(queries)}]: {q}")
+                logger.info(f"{'=' * 60}")
+
+                prod = self.scrape(nav, q)
+                if prod:
+                    results.append(asdict(prod))
+                else:
+                    results.append({k: (q if k == "input_ean" else "")
+                                    for k in fields})
+
+                if i < len(queries):
+                    time.sleep(BH.delay())
+
             browser.close()
-        
-        logger.info(f"\n{'='*60}")
-        logger.info(f"✓ Complete! Results: {self.config.OUTPUT_FILE}")
-        logger.info(f"{'='*60}")
 
-    def extract_pdf_fields(self, pdf_url: str) -> Tuple[str, str]:
-        """Download PDF and extract energy class + supplier info."""
-        if not pdf_url or pdf_url == "Not found":
-            return ("Not found", "Not found")
-        
-        pdf_bytes = self.fetch_pdf_bytes(pdf_url)
-        if not pdf_bytes:
-            return ("Not found", "Not found")
-        
-        return self.parse_pdf_fields(pdf_bytes)
-    
-    def fetch_pdf_bytes(self, url: str) -> Optional[bytes]:
-        """Fetch PDF bytes with stdlib (no browser download)."""
+        self._write_csv(fields, results)
+        self._write_xlsx(fields, results)
+        logger.info(f"\nDone! Results: {self.config.OUTPUT_FILE}")
+
+    def _write_csv(self, fields: list[str], results: list[dict]):
+        """Write CSV with space after each comma for readability."""
+        with open(self.config.OUTPUT_FILE, "w", encoding="utf-8") as f:
+            f.write(", ".join(fields) + "\n")
+            for row in results:
+                values = []
+                for field in fields:
+                    val = str(row.get(field, ""))
+                    if "," in val or '"' in val:
+                        val = '"' + val.replace('"', '""') + '"'
+                    values.append(val)
+                f.write(", ".join(values) + "\n")
+
+    def _write_xlsx(self, fields: list[str], results: list[dict]):
+        """Write XLSX output if openpyxl is available."""
         try:
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    "Accept": "application/pdf"
-                }
-            )
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                return resp.read()
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
-            logger.warning(f"PDF download failed: {e}")
-            return None
-    
-    def parse_pdf_fields(self, pdf_bytes: bytes) -> Tuple[str, str]:
-        """Extract fields from PDF text, preferring page 6/25 if present."""
-        pages = self._extract_pdf_pages_text(pdf_bytes)
-        if not pages:
-            pages = []
-        
-        # Prefer specified pages if they exist; otherwise search all pages
-        energy_pages = []
-        supplier_pages = []
-        if len(pages) >= 6:
-            energy_pages = [pages[5]]
-        if len(pages) >= 25:
-            supplier_pages = [pages[24]]
-        
-        if not energy_pages:
-            energy_pages = pages
-        if not supplier_pages:
-            supplier_pages = pages
-        
-        energy = self._extract_energy_class_from_pages(energy_pages)
-        supplier = self._extract_supplier_info_from_pages(supplier_pages)
-        
-        # If not found and OCR enabled, try OCR fallback
-        if self.config.OCR_ENABLED and (not energy or not supplier):
-            ocr_pages = self._extract_pdf_pages_text_ocr(pdf_bytes)
-            if ocr_pages:
-                if not energy:
-                    energy = self._extract_energy_class_from_pages(ocr_pages)
-                if not supplier:
-                    supplier = self._extract_supplier_info_from_pages(ocr_pages)
+            from openpyxl import Workbook
+            from openpyxl.styles import Font, Alignment
+        except ImportError:
+            logger.info("openpyxl not installed — skipping XLSX.")
+            return
 
-        return (energy or "Not found", supplier or "Not found")
-    
-    def _extract_pdf_pages_text(self, pdf_bytes: bytes) -> list[str]:
-        """Extract text for all pages using available PDF parser."""
-        try:
-            import pdfplumber  # type: ignore
-            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                return [page.extract_text() or "" for page in pdf.pages]
-        except Exception:
-            try:
-                from PyPDF2 import PdfReader  # type: ignore
-                reader = PdfReader(io.BytesIO(pdf_bytes))
-                return [(page.extract_text() or "") for page in reader.pages]
-            except Exception as e:
-                logger.warning(f"PDF parsing failed: {e}")
-                return []
+        xlsx_path = self.config.OUTPUT_FILE.rsplit(".", 1)[0] + ".xlsx"
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Otto Products"
 
-    def _extract_pdf_pages_text_ocr(self, pdf_bytes: bytes) -> list[str]:
-        """OCR text from PDF pages using tesseract."""
-        try:
-            from pdf2image import convert_from_bytes, pdfinfo_from_bytes  # type: ignore
-            import pytesseract  # type: ignore
-        except Exception as e:
-            logger.warning(f"OCR dependencies missing: {e}")
-            return []
+        headers = {
+            "input_ean": ("Search Query", 45),
+            "product_url": ("Product URL", 70),
+            "pdf_link": ("PDF Link", 70),
+            "energy_efficiency_class": ("Energy Class", 15),
+            "energylevel_link": ("Energy Level Link", 60),
+            "supplier_information": ("Supplier Information", 60),
+        }
 
-        try:
-            info = pdfinfo_from_bytes(pdf_bytes, poppler_path=self.config.POPPLER_PATH)
-            page_count = int(info.get("Pages", 0))
-        except Exception:
-            page_count = 0
+        bold = Font(bold=True)
+        wrap = Alignment(wrap_text=True, vertical="top")
 
-        page_numbers = []
-        if page_count >= 25:
-            page_numbers = [6, 25]
-        elif page_count >= 6:
-            page_numbers = [6]
-        elif page_count > 0:
-            page_numbers = list(range(1, page_count + 1))
-        else:
-            page_numbers = [1]
+        for col, field in enumerate(fields, 1):
+            label, width = headers.get(field, (field, 20))
+            cell = ws.cell(row=1, column=col, value=label)
+            cell.font = bold
+            ws.column_dimensions[chr(64 + col)].width = width
 
-        ocr_texts = []
-        for page_number in page_numbers:
-            try:
-                images = convert_from_bytes(
-                    pdf_bytes,
-                    dpi=self.config.OCR_DPI,
-                    fmt="png",
-                    first_page=page_number,
-                    last_page=page_number,
-                    poppler_path=self.config.POPPLER_PATH
-                )
-                if images:
-                    pytesseract.pytesseract.tesseract_cmd = self.config.TESSERACT_CMD
-                    try:
-                        text = pytesseract.image_to_string(images[0], lang=self.config.OCR_LANG) or ""
-                    except Exception:
-                        text = pytesseract.image_to_string(images[0], lang="eng") or ""
-                    ocr_texts.append(text)
-            except Exception as e:
-                logger.warning(f"OCR failed for page {page_number}: {e}")
+        for r, row in enumerate(results, 2):
+            for c, field in enumerate(fields, 1):
+                cell = ws.cell(row=r, column=c, value=row.get(field, ""))
+                cell.alignment = wrap
 
-        return ocr_texts
-    
-    def _extract_labeled_value_across_pages(
-        self,
-        pages: list[str],
-        labels: list[str],
-        value_pattern: Optional[str] = None
-    ) -> str:
-        """Find a label in any page and return value from same/next line."""
-        for text in pages:
-            value = self._extract_labeled_value(text, labels, value_pattern)
-            if value:
-                return value
-        return ""
+        wb.save(xlsx_path)
+        logger.info(f"XLSX saved: {xlsx_path}")
 
-    def _extract_energy_class_from_pages(self, pages: list[str]) -> str:
-        """Extract energy class (A-G/+++) from any page text."""
-        for text in pages:
-            if not text:
-                continue
-            # Try direct regex on full text
-            match = re.search(
-                r"(Energy\\s*efficiency\\s*class|Energieeffizienzklasse)\\s*[:\\-]?\\s*([A-G][+]{0,3})",
-                text,
-                re.I
-            )
-            if match:
-                return match.group(2)
-            # Fallback to line-based label
-            value = self._extract_labeled_value(
-                text,
-                ["Energy efficiency class", "Energieeffizienzklasse"],
-                value_pattern=r"[A-G][+]{0,3}"
-            )
-            if value:
-                return value
-        return ""
-
-    def _extract_supplier_info_from_pages(self, pages: list[str]) -> str:
-        """Extract supplier info block from any page text."""
-        labels_after = [
-            "Supplier information",
-            "Lieferanteninformation",
-            "Anschrift des Lieferanten"
-        ]
-        labels_before = [
-            "Supplier's address",
-            "Supplier address",
-            "Lieferant",
-            "Supplier"
-        ]
-        for text in pages:
-            if not text:
-                continue
-            # German label sometimes appears inline without line breaks
-            inline = self._extract_inline_after_label(
-                text,
-                ["Anschrift des Lieferanten"]
-            )
-            if inline:
-                return self._clean_supplier_value(inline)
-            # Prefer block after explicit info label
-            block = self._extract_block_after_label(text, labels_after, max_lines=4)
-            if block:
-                return self._clean_supplier_value(block)
-            # Common pattern: address follows the guarantee line
-            block = self._extract_block_after_phrases(
-                text,
-                [
-                    "Minimum duration of the guarantee offered by the supplier",
-                    "Mindestdauer der vom Lieferanten angebotenen Garantie"
-                ],
-                max_lines=4
-            )
-            if block:
-                return self._clean_supplier_value(block)
-            # If label appears after the address, capture preceding lines
-            block = self._extract_block_before_label(text, labels_before, max_lines=4)
-            if block:
-                return self._clean_supplier_value(block)
-            # Fallback to labeled single-line extraction
-            value = self._extract_labeled_value(text, labels_after + labels_before)
-            if value and not self._looks_like_annotation(value):
-                return self._clean_supplier_value(value)
-        return ""
-
-    def _extract_block_after_phrases(self, text: str, phrases: list[str], max_lines: int = 4) -> str:
-        """Return a block of lines after a line containing any phrase."""
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        lower_lines = [line.lower() for line in lines]
-        for phrase in phrases:
-            phrase_lower = phrase.lower()
-            for i, line in enumerate(lower_lines):
-                if phrase_lower in line:
-                    collected = []
-                    for j in range(i + 1, min(i + 1 + max_lines, len(lines))):
-                        if re.match(r"^\d+\.", lines[j]):
-                            break
-                        if lines[j].startswith("("):
-                            break
-                        if self._looks_like_section_heading(lines[j]):
-                            break
-                        if self._looks_like_annotation(lines[j]):
-                            continue
-                        collected.append(lines[j])
-                    if collected:
-                        return " ".join(collected)
-        return ""
-
-    def _extract_inline_after_label(self, text: str, labels: list[str]) -> str:
-        """Extract inline value after a label in a long text line."""
-        for label in labels:
-            pattern = r"\s+".join(map(re.escape, label.split()))
-            match = re.search(
-                rf"{pattern}\s*(?:\([a-z]\)\s*)*:?\s*(.+)",
-                text,
-                re.I | re.S
-            )
-            if match:
-                value = match.group(1).strip()
-                return value
-        return ""
-
-    def _extract_block_after_label(self, text: str, labels: list[str], max_lines: int = 4) -> str:
-        """Return a block of lines after a label line."""
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        lower_lines = [line.lower() for line in lines]
-        for label in labels:
-            label_lower = label.lower()
-            for i, line in enumerate(lower_lines):
-                if label_lower in line:
-                    collected = []
-                    for j in range(i + 1, min(i + 1 + max_lines, len(lines))):
-                        if re.match(r"^\\([a-z]\\)\\s*$", lines[j], re.I):
-                            break
-                        if re.match(r"^\d+\.", lines[j]):
-                            break
-                        if lines[j].startswith("("):
-                            break
-                        if self._looks_like_section_heading(lines[j]):
-                            break
-                        collected.append(lines[j])
-                    if collected:
-                        return " ".join(collected)
-        return ""
-
-    def _extract_block_before_label(self, text: str, labels: list[str], max_lines: int = 4) -> str:
-        """Return a block of lines before a label line."""
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        lower_lines = [line.lower() for line in lines]
-        for label in labels:
-            label_lower = label.lower()
-            for i, line in enumerate(lower_lines):
-                if label_lower in line:
-                    collected = []
-                    start = max(0, i - max_lines)
-                    for j in range(i - 1, start - 1, -1):
-                        if re.match(r"^\d+\.", lines[j]):
-                            break
-                        if self._looks_like_section_heading(lines[j]):
-                            break
-                        if self._looks_like_annotation(lines[j]):
-                            continue
-                        collected.append(lines[j])
-                    if collected:
-                        return " ".join(reversed(collected))
-        return ""
-
-    def _looks_like_annotation(self, text: str) -> bool:
-        stripped = text.strip()
-        if not stripped:
-            return True
-        if re.fullmatch(r"(\\([a-z]\\)\\s*)+", stripped, re.I):
-            return True
-        if len(stripped) <= 2:
-            return True
-        return False
-
-    def _looks_like_section_heading(self, text: str) -> bool:
-        lower = text.lower()
-        return (
-            "product information sheet" in lower
-            or "produktdatenblatt" in lower
-            or "additional information" in lower
-            or "repairability" in lower
-        )
-
-    def _clean_supplier_value(self, value: str) -> str:
-        """Trim annotations and trailing sections from supplier value."""
-        text = value.strip().replace("’", "'")
-        # Remove known labels if included
-        text = re.sub(
-            r"^(supplier information|lieferanteninformation|anschrift des lieferanten|supplier's address|supplier address)\\s*",
-            "",
-            text,
-            flags=re.I
-        )
-        # Remove trailing label artifacts if OCR placed them after the address
-        text = re.sub(r"\bsupplier\s*'?s\s*address.*$", "", text, flags=re.I)
-        text = re.sub(r"\banschrift des lieferanten.*$", "", text, flags=re.I)
-        # Remove standalone annotation markers
-        text = re.sub(r"\\s*(\\([a-z]\\)\\s*)+\\s*$", "", text, flags=re.I)
-        # Cut off at section headings
-        for marker in [
-            "Produktdatenblatt",
-            "Product information sheet",
-            "Additional information",
-            "Angaben zur Reparierbarkeit"
-        ]:
-            idx = text.lower().find(marker.lower())
-            if idx != -1:
-                text = text[:idx].strip()
-        # Cut off when a new numbered section begins (common in these PDFs)
-        text = re.sub(r"\d{1,2}\.\s+.+$", "", text).strip()
-        # Insert spaces where OCR concatenates words/lines
-        text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
-        text = re.sub(r"([A-Za-z])([0-9])", r"\1 \2", text)
-        text = re.sub(r"([0-9])([A-Za-z])", r"\1 \2", text)
-        # Collapse whitespace
-        text = re.sub(r"\s+", " ", text).strip()
-        return text
-
-    
-    def _extract_labeled_value(
-        self,
-        text: str,
-        labels: list[str],
-        value_pattern: Optional[str] = None
-    ) -> str:
-        """Find a label in text and return its value from same/next line."""
-        if not text:
-            return ""
-        
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        lower_lines = [line.lower() for line in lines]
-        
-        for label in labels:
-            label_lower = label.lower()
-            for i, line in enumerate(lower_lines):
-                if label_lower in line:
-                    original_line = lines[i]
-                    # Try same-line "Label: value"
-                    match = re.search(rf"{re.escape(label)}\s*[:\-]?\s*(.+)", original_line, re.I)
-                    if match and match.group(1).strip():
-                        candidate = match.group(1).strip()
-                        if value_pattern:
-                            val_match = re.search(value_pattern, candidate)
-                            if val_match:
-                                return val_match.group(0)
-                        return candidate
-                    
-                    # Fallback to next line
-                    if i + 1 < len(lines):
-                        candidate = lines[i + 1].strip()
-                        if value_pattern:
-                            val_match = re.search(value_pattern, candidate)
-                            if val_match:
-                                return val_match.group(0)
-                        return candidate
-        
-        return ""
-
-
-# ============================================================================
-# ENTRY POINT
-# ============================================================================
 
 def main():
-    """Entry point"""
     try:
-        scraper = Scraper()
-        scraper.run()
+        Scraper().run()
     except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
+        logger.error(f"Fatal: {e}", exc_info=True)
         raise
 
 
