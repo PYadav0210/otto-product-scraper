@@ -24,6 +24,20 @@ import urllib.error
 
 from playwright.sync_api import sync_playwright, Page
 
+# Optional: stealth to prevent captchas from appearing
+try:
+    from playwright_stealth import stealth_sync
+    HAS_STEALTH = True
+except ImportError:
+    HAS_STEALTH = False
+
+# Optional: 2captcha to solve captchas when they appear
+try:
+    from twocaptcha import TwoCaptcha
+    HAS_2CAPTCHA = True
+except ImportError:
+    HAS_2CAPTCHA = False
+
 
 # ============================================================================
 # CONFIGURATION
@@ -53,6 +67,11 @@ class Config:
     OCR_LANG = "eng+deu"
     POPPLER_PATH = "/opt/homebrew/bin"
     TESSERACT_CMD = "/opt/homebrew/bin/tesseract"
+
+    # --- Captcha settings ---
+    TWOCAPTCHA_API_KEY = ""
+    CAPTCHA_MAX_RETRIES = 3
+    CAPTCHA_WAIT_AFTER_SOLVE = 3
 
 
 @dataclass
@@ -281,9 +300,9 @@ def _tokenize(qn: str) -> list[str]:
 def _normalize(text: str) -> str:
     text = text.lower()
     # Split joined tokens: "flip7" -> "flip 7", "128gb" -> "128 gb"
-    text = re.sub(r"([a-z\u00e4\u00f6\u00fc\u00df])(\d)", r"\1 \2", text)
-    text = re.sub(r"(\d)([a-z\u00e4\u00f6\u00fc\u00df])", r"\1 \2", text)
-    text = re.sub(r"[^a-z0-9\u00e4\u00f6\u00fc\u00df]+", " ", text)
+    text = re.sub(r"([a-zäöüß])(\d)", r"\1 \2", text)
+    text = re.sub(r"(\d)([a-zäöüß])", r"\1 \2", text)
+    text = re.sub(r"[^a-z0-9äöüß]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -357,6 +376,124 @@ class BH:
 
 
 # ============================================================================
+# CAPTCHA DETECTION & SOLVING
+# ============================================================================
+
+class CaptchaSolver:
+    """Detects and solves captchas. Install: pip install playwright-stealth 2captcha-python"""
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.solver = None
+        if HAS_2CAPTCHA and config.TWOCAPTCHA_API_KEY:
+            self.solver = TwoCaptcha(config.TWOCAPTCHA_API_KEY)
+            logger.info("2Captcha solver initialized")
+
+    @staticmethod
+    def apply_stealth(page: Page):
+        if HAS_STEALTH:
+            stealth_sync(page)
+            logger.info("Stealth patches applied")
+
+    def detect_captcha(self, page: Page) -> Optional[str]:
+        try:
+            return page.evaluate("""() => {
+                if (document.querySelector('iframe[src*="recaptcha"]') ||
+                    document.querySelector('.g-recaptcha')) return 'recaptcha';
+                if (document.querySelector('iframe[src*="hcaptcha"]') ||
+                    document.querySelector('.h-captcha')) return 'hcaptcha';
+                if (document.querySelector('iframe[src*="challenges.cloudflare"]') ||
+                    document.querySelector('.cf-turnstile')) return 'turnstile';
+                const body = (document.body.innerText || '').toLowerCase();
+                if (body.includes('captcha') || body.includes('are you human') ||
+                    body.includes('bist du ein mensch') ||
+                    body.includes('ich bin kein roboter')) return 'generic';
+                return null;
+            }""")
+        except Exception:
+            return None
+
+    def solve(self, page: Page) -> bool:
+        ctype = self.detect_captcha(page)
+        if not ctype:
+            return True
+        logger.warning(f"CAPTCHA detected: {ctype}")
+        if not self.solver:
+            if not Config.HEADLESS:
+                logger.info("Waiting 60s for manual captcha solve...")
+                for _ in range(60):
+                    time.sleep(1)
+                    if not self.detect_captcha(page):
+                        logger.info("Captcha solved manually!")
+                        return True
+            return False
+        for _ in range(self.config.CAPTCHA_MAX_RETRIES):
+            try:
+                sitekey = self._get_sitekey(page, ctype)
+                if not sitekey:
+                    return False
+                token = self._solve_type(ctype, sitekey, page.url)
+                if token:
+                    self._inject(page, ctype, token)
+                    time.sleep(self.config.CAPTCHA_WAIT_AFTER_SOLVE)
+                    if not self.detect_captcha(page):
+                        logger.info("Captcha solved!")
+                        return True
+            except Exception as e:
+                logger.error(f"Captcha error: {e}")
+        return False
+
+    def _get_sitekey(self, page, ctype):
+        try:
+            return page.evaluate("""(type) => {
+                if (type === 'recaptcha') {
+                    const el = document.querySelector('.g-recaptcha[data-sitekey]');
+                    if (el) return el.getAttribute('data-sitekey');
+                    const f = document.querySelector('iframe[src*="recaptcha"]');
+                    if (f) { const m = f.src.match(/[?&]k=([^&]+)/); if (m) return m[1]; }
+                }
+                if (type === 'hcaptcha') {
+                    const el = document.querySelector('.h-captcha[data-sitekey]');
+                    if (el) return el.getAttribute('data-sitekey');
+                }
+                if (type === 'turnstile') {
+                    const el = document.querySelector('.cf-turnstile[data-sitekey], [data-sitekey]');
+                    if (el) return el.getAttribute('data-sitekey');
+                }
+                return null;
+            }""", ctype)
+        except Exception:
+            return None
+
+    def _solve_type(self, ctype, sitekey, url):
+        if ctype == 'recaptcha':
+            r = self.solver.recaptcha(sitekey=sitekey, url=url)
+        elif ctype == 'hcaptcha':
+            r = self.solver.hcaptcha(sitekey=sitekey, url=url)
+        elif ctype == 'turnstile':
+            r = self.solver.turnstile(sitekey=sitekey, url=url)
+        else:
+            return None
+        return r.get("code", "")
+
+    def _inject(self, page, ctype, token):
+        page.evaluate("""(args) => {
+            const [type, token] = args;
+            if (type === 'recaptcha') {
+                const el = document.querySelector('#g-recaptcha-response, textarea[name="g-recaptcha-response"]');
+                if (el) el.value = token;
+                const form = document.querySelector('form'); if (form) form.submit();
+            } else if (type === 'hcaptcha') {
+                const el = document.querySelector('[name="h-captcha-response"]');
+                if (el) el.value = token;
+            } else if (type === 'turnstile') {
+                const el = document.querySelector('[name="cf-turnstile-response"]');
+                if (el) el.value = token;
+            }
+        }""", [ctype, token])
+
+
+# ============================================================================
 # OTTO NAVIGATOR
 # ============================================================================
 
@@ -372,9 +509,14 @@ CARD_SELECTORS = [
 
 
 class OttoNavigator:
-    def __init__(self, page: Page):
+    def __init__(self, page: Page, captcha_solver: Optional[CaptchaSolver] = None):
         self.page = page
         self._cookies_done = False
+        self.captcha_solver = captcha_solver
+
+    def _check_captcha(self):
+        if self.captcha_solver and self.captcha_solver.detect_captcha(self.page):
+            self.captcha_solver.solve(self.page)
 
     def accept_cookies(self):
         try:
@@ -397,6 +539,7 @@ class OttoNavigator:
     def search_product(self, query: str):
         logger.info(f"Searching: {query}")
         self.page.goto("https://www.otto.de/", wait_until="domcontentloaded")
+        self._check_captcha()
         self.accept_cookies()
         BH.mouse_move(self.page)
         time.sleep(BH.short_delay())
@@ -422,6 +565,7 @@ class OttoNavigator:
         search_box.press("Enter")
 
         self.page.wait_for_load_state("domcontentloaded")
+        self._check_captcha()
         self._wait_for_cards()
 
     def _wait_for_cards(self):
@@ -523,12 +667,6 @@ class OttoNavigator:
             )
             return self._click_candidate(best)
 
-        if qi.model_number:
-            logger.info(
-                "No valid match: model mismatch/conflict across candidates "
-                f"(required model={qi.model_number})"
-            )
-
         return False
 
     def _evaluate_card(self, card, idx: int,
@@ -575,6 +713,12 @@ class OttoNavigator:
 
             # Model number near product line
             if qi.model_number:
+                # HARD REJECT: if a DIFFERENT model number appears near
+                # the product line, this is the wrong product entirely
+                # e.g., searching "iphone 14" but card says "iphone 17"
+                if self._conflicting_model(combined, qi):
+                    return None
+
                 if self._model_near(combined, qi):
                     score += 15
                 elif re.search(
@@ -582,11 +726,7 @@ class OttoNavigator:
                 ):
                     score += 5
                 else:
-                    score -= 10  # Model not found
-
-                # Conflicting model
-                if self._conflicting_model(combined, qi):
-                    score -= 20
+                    score -= 10  # Model not found at all
 
             # Samsung sub-family (flip vs fold vs s)
             if qi.samsung_sub:
@@ -616,15 +756,6 @@ class OttoNavigator:
                    ["smartphone", "handy", "mobiltelefon"]):
                 score += 5
 
-            # Candidate must satisfy model correctness when a model is requested.
-            model_ok = True
-            if qi.model_number:
-                has_model = bool(
-                    self._model_near(combined, qi)
-                    or re.search(rf"\b{re.escape(qi.model_number)}\b", combined)
-                )
-                model_ok = has_model and (not self._conflicting_model(combined, qi))
-
             # Must have positive score
             if score <= 0:
                 return None
@@ -635,6 +766,15 @@ class OttoNavigator:
                 link = card.locator("a").first
                 if link.count() == 0:
                     return None
+
+            # Candidate must satisfy model correctness when a model is requested.
+            model_ok = True
+            if qi.model_number:
+                has_model = bool(
+                    self._model_near(combined, qi)
+                    or re.search(rf"\b{re.escape(qi.model_number)}\b", combined)
+                )
+                model_ok = has_model and (not self._conflicting_model(combined, qi))
 
             return (score, idx, link, model_ok)
 
@@ -702,6 +842,7 @@ class OttoNavigator:
             except Exception:
                 pass
             self.page.wait_for_load_state("domcontentloaded")
+            self._check_captcha()
             time.sleep(BH.short_delay())
             logger.info(f"Product URL: {self.page.url}")
             return True
@@ -856,6 +997,10 @@ class OttoNavigator:
         # The label area is clickable and reveals the full energy sheet
         for click_sel in [
             ".pdp_eek__label",
+            "[class*='pdp_eek__label']",
+            ".js_openInPaliSheet",
+            "img.pdp_eek__label-img",
+            "[class*='pdp_eek'] [class*='label']",
         ]:
             try:
                 el = self.page.locator(click_sel).first
@@ -871,65 +1016,70 @@ class OttoNavigator:
     # ENERGY CLASS — from product page DOM
     # ------------------------------------------------------------------
     def get_energy_class_from_page(self) -> str:
-        """Extract energy class strictly from .pdp_eek__label only."""
+        """Extract energy class from img.pdp_eek__label-img alt attribute."""
         logger.info("Extracting energy class from page...")
 
         # Scroll to the energy section first
         self._scroll_to_energy_section()
 
-        # Strict method: class must come from .pdp_eek__label block only
+        # Method 1: img.pdp_eek__label-img alt="A"
         try:
-            label = self.page.locator(".pdp_eek__label").first
-            if label.count() > 0:
-                el = label.locator("img.pdp_eek__label-img").first
+            el = self.page.locator("img.pdp_eek__label-img").first
+            if el.count() > 0:
                 alt = (el.get_attribute("alt") or "").strip()
                 if re.fullmatch(r"[A-G][+]{0,3}", alt):
-                    logger.info(f"Energy class from .pdp_eek__label img alt: {alt}")
+                    logger.info(f"Energy class from page: {alt}")
                     return alt
-
                 src = el.get_attribute("src") or ""
                 m = re.search(r"pl_eek_([a-g])", src, re.I)
                 if m:
-                    logger.info(f"Energy class from .pdp_eek__label img src: {m.group(1).upper()}")
+                    logger.info(f"Energy class from src: {m.group(1).upper()}")
                     return m.group(1).upper()
+        except Exception:
+            pass
 
-                # Fallback inside label text only (still strict to selector)
-                text = label.inner_text().strip()
+        # Method 2: Text inside pdp_eek container
+        try:
+            el = self.page.locator("[class*='pdp_eek']").first
+            if el.count() > 0:
+                text = el.inner_text().strip()
                 m = re.search(r"\b([A-G])\+{0,3}\b", text)
                 if m:
-                    logger.info(f"Energy class from .pdp_eek__label text: {m.group(0)}")
+                    logger.info(f"Energy class from eek text: {m.group(0)}")
                     return m.group(0)
         except Exception:
             pass
 
-        logger.info("Energy class not found in .pdp_eek__label")
+        # Method 3: Any img with src containing pl_eek
+        try:
+            imgs = self.page.locator("img[src*='pl_eek']").all()
+            for img in imgs:
+                src = img.get_attribute("src") or ""
+                m = re.search(r"pl_eek_([a-g])", src, re.I)
+                if m:
+                    logger.info(f"Energy class from img src: {m.group(1).upper()}")
+                    return m.group(1).upper()
+                alt = (img.get_attribute("alt") or "").strip()
+                if re.fullmatch(r"[A-G][+]{0,3}", alt):
+                    return alt
+        except Exception:
+            pass
+
+        logger.info("Energy class not found on page")
         return ""
 
     # ------------------------------------------------------------------
     # ENERGY LEVEL IMAGE LINK — from product page DOM
     # ------------------------------------------------------------------
     def get_energy_image_link(self) -> str:
-        """Extract energy label sheet image URL.
-
-        From the DOM (after clicking/expanding):
-        <img class="pdp_eek__sheet-image"
-             srcset="https://i.otto.de/i/otto/fcc7cb20-3284-57f6-9823-47e55dfcfbe8 2x"
-             src="https://i.otto.de/i/otto/fcc7cb20-3284-57f6-9823-47e55dfcfbe8">
-
-        We want the URL from srcset (without the "2x" part).
-        """
+        """Extract energy label sheet image URL."""
         logger.info("Extracting energy label image link...")
 
-        # The energy section should already be scrolled to and expanded
-        # by get_energy_class_from_page() which runs before this
-
-        # Method 1: img.pdp_eek__sheet-image — exact class from user's DOM
         try:
             el = self.page.locator("img.pdp_eek__sheet-image").first
             if el.count() > 0:
                 srcset = el.get_attribute("srcset") or ""
                 if srcset:
-                    # srcset="https://i.otto.de/i/otto/xxx 2x" — take URL part
                     url = srcset.split()[0].strip()
                     if url.startswith("http"):
                         logger.info(f"Energy image from srcset: {url}")
@@ -941,7 +1091,6 @@ class OttoNavigator:
         except Exception:
             pass
 
-        # Method 2: Any img inside pdp_eek__sheet-image-container
         try:
             el = self.page.locator(".pdp_eek__sheet-image-container img").first
             if el.count() > 0:
@@ -957,7 +1106,6 @@ class OttoNavigator:
         except Exception:
             pass
 
-        # Method 3: Try using JavaScript to find the image in shadow DOM or lazy-loaded
         try:
             url = self.page.evaluate("""
                 () => {
@@ -972,7 +1120,6 @@ class OttoNavigator:
                             return innerImg.srcset ? innerImg.srcset.split(' ')[0] : innerImg.src;
                         }
                     }
-                    // Search all images for otto.de energy label URLs
                     const allImgs = document.querySelectorAll('img[srcset*="i.otto.de"]');
                     for (const i of allImgs) {
                         const parent = i.closest('[class*="pdp_eek"]');
@@ -989,7 +1136,6 @@ class OttoNavigator:
         except Exception:
             pass
 
-        # Method 4: Wait a bit more and retry (lazy loading)
         try:
             time.sleep(1.0)
             el = self.page.locator("img.pdp_eek__sheet-image").first
@@ -1014,180 +1160,331 @@ class OttoNavigator:
     # ------------------------------------------------------------------
     def get_supplier_from_page(self) -> str:
         """Click 'Details zur Produktsicherheit' / 'Details on product safety'
-        and extract supplier info from the popup that opens."""
+        and extract supplier info from the popup/slide panel that opens."""
         logger.info("Getting supplier from product safety popup...")
 
         # Step 1: Scroll down to Important Information section
-        for _ in range(5):
+        found_section = False
+        for scroll_try in range(10):
             try:
                 for marker in ["Wichtige Informationen",
                                "Important information"]:
                     el = self.page.get_by_text(marker, exact=False).first
                     if el.count() > 0 and el.is_visible():
                         el.scroll_into_view_if_needed()
+                        time.sleep(0.3)
+                        found_section = True
                         break
-                break
-            except Exception:
-                pass
-            BH.scroll(self.page, 800)
-            time.sleep(0.2)
-
-        # Step 2: Click the product safety link
-        clicked = False
-        click_labels = [
-            "Details zur Produktsicherheit",
-            "Details on product safety",
-            "Angaben zur Produktsicherheit",
-            "Product safety details",
-            "Produktsicherheit",
-        ]
-        for label in click_labels:
-            if clicked:
-                break
-            try:
-                el = self.page.get_by_text(label, exact=False).first
-                if el.count() > 0:
-                    el.scroll_into_view_if_needed()
-                    time.sleep(0.15)
-                    el.click(timeout=5000)
-                    time.sleep(0.8)
-                    clicked = True
-                    logger.info(f"Clicked: {label}")
+                if found_section:
                     break
             except Exception:
                 pass
+            BH.scroll(self.page, 800)
+            time.sleep(0.3)
+
+        if not found_section:
+            logger.info("'Wichtige Informationen' section not found")
+
+        # Step 2: Find and click the product safety link using JavaScript
+        clicked = self.page.evaluate("""
+        () => {
+            const labels = [
+                'Details zur Produktsicherheit',
+                'Details on product safety',
+                'Angaben zur Produktsicherheit',
+                'Product safety details',
+            ];
+            const allEls = document.querySelectorAll('a, button, span, div[role="button"], [onclick], [class*="link"]');
+            for (const el of allEls) {
+                const text = (el.textContent || '').trim();
+                for (const label of labels) {
+                    if (text.includes(label) || text === label) {
+                        el.scrollIntoView({block: 'center'});
+                        el.click();
+                        return label;
+                    }
+                }
+            }
+            const all = document.querySelectorAll('*');
+            for (const el of all) {
+                const directText = Array.from(el.childNodes)
+                    .filter(n => n.nodeType === 3)
+                    .map(n => n.textContent.trim())
+                    .join(' ');
+                for (const label of labels) {
+                    if (directText.includes(label)) {
+                        el.scrollIntoView({block: 'center'});
+                        el.click();
+                        return label;
+                    }
+                }
+            }
+            return null;
+        }
+        """)
+
+        if not clicked:
+            for label in ["Details zur Produktsicherheit",
+                          "Details on product safety"]:
+                try:
+                    el = self.page.get_by_text(label, exact=False).first
+                    if el.count() > 0:
+                        el.scroll_into_view_if_needed()
+                        time.sleep(0.15)
+                        el.click(timeout=5000)
+                        clicked = label
+                        logger.info(f"Clicked via Playwright: {label}")
+                        break
+                except Exception:
+                    pass
 
         if not clicked:
             logger.info("Product safety link not found")
             return ""
 
-        # Step 3: Extract text from popup/side panel
-        supplier_text = ""
-        try:
-            time.sleep(0.5)
-            popup_text = ""
+        logger.info(f"Clicked: {clicked}")
 
-            for sel in ["[role='dialog']", "[aria-modal='true']",
-                        "[class*='modal']", "[class*='Modal']",
-                        "[class*='dialog']", "[class*='Dialog']",
-                        "[class*='overlay']", "[class*='Overlay']",
-                        "[class*='slide']", "[class*='panel']",
-                        "[class*='drawer']", "[class*='Drawer']"]:
-                try:
-                    els = self.page.locator(sel).all()
-                    for el in els:
-                        if el.is_visible():
-                            text = el.inner_text()
-                            tl = text.lower()
-                            if ("responsible" in tl or "verantwortlich" in tl
-                                    or "wirtschaftsakteur" in tl
-                                    or "economic operator" in tl):
-                                popup_text = text
-                                break
-                    if popup_text:
-                        break
-                except Exception:
-                    continue
+        # Step 3: Wait for the panel/popup to appear
+        time.sleep(1.5)
 
-            if not popup_text:
-                try:
-                    popup_text = self.page.inner_text("body")
-                except Exception:
-                    pass
+        # Step 4: Use JavaScript to find the supplier text
+        supplier_text = self.page.evaluate("""
+        () => {
+            const keywords = [
+                'wirtschaftsakteur', 'economic operator',
+                'responsible person', 'verantwortliche person',
+                'verantwortlich für dieses produkt',
+                'located in the eu', 'in der eu'
+            ];
 
-            if popup_text:
-                supplier_text = self._parse_supplier_popup(popup_text)
+            const candidates = document.querySelectorAll(
+                '[role="dialog"], [aria-modal], ' +
+                '[class*="modal"], [class*="Modal"], ' +
+                '[class*="drawer"], [class*="Drawer"], ' +
+                '[class*="slide"], [class*="Slide"], ' +
+                '[class*="panel"], [class*="Panel"], ' +
+                '[class*="overlay"], [class*="Overlay"], ' +
+                '[class*="layer"], [class*="Layer"], ' +
+                '[class*="sheet"], [class*="Sheet"], ' +
+                '[class*="popup"], [class*="Popup"], ' +
+                '[class*="flyout"], [class*="Flyout"], ' +
+                '[class*="sidebar"], [class*="Sidebar"], ' +
+                '[class*="aside"], aside, ' +
+                '[class*="product-safety"], [class*="productSafety"], ' +
+                '[class*="pali"], [class*="Pali"]'
+            );
 
-        except Exception as e:
-            logger.debug(f"Popup extraction error: {e}")
+            for (const el of candidates) {
+                if (!el.offsetParent && el.style.display !== 'fixed') continue;
+                const text = el.innerText || '';
+                const tl = text.toLowerCase();
+                if (keywords.some(k => tl.includes(k))) {
+                    return text;
+                }
+            }
 
-        # Step 4: Close popup
-        try:
-            for close_sel in [
-                "button[aria-label='Close']",
-                "button[aria-label='Schließen']",
-                "button[aria-label='close']",
-            ]:
-                btn = self.page.locator(close_sel).first
-                if btn.count() > 0 and btn.is_visible():
-                    btn.click(timeout=2000)
-                    time.sleep(0.2)
-                    break
-            else:
-                self.page.keyboard.press("Escape")
-                time.sleep(0.2)
-        except Exception:
-            try:
-                self.page.keyboard.press("Escape")
-                time.sleep(0.2)
-            except Exception:
-                pass
+            const allDivs = document.querySelectorAll('div, section, aside');
+            let best = null;
+            let bestLen = 999999;
+            for (const el of allDivs) {
+                const style = window.getComputedStyle(el);
+                const z = parseInt(style.zIndex) || 0;
+                const pos = style.position;
+                if (z > 10 || pos === 'fixed' || pos === 'absolute') {
+                    if (!el.offsetParent && pos !== 'fixed') continue;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 50 || rect.height < 50) continue;
+                    const text = el.innerText || '';
+                    const tl = text.toLowerCase();
+                    if (keywords.some(k => tl.includes(k))) {
+                        if (text.length < bestLen) {
+                            best = text;
+                            bestLen = text.length;
+                        }
+                    }
+                }
+            }
+            if (best) return best;
 
+            const body = document.body.innerText || '';
+            const bl = body.toLowerCase();
+            if (keywords.some(k => bl.includes(k))) {
+                for (const kw of keywords) {
+                    const idx = bl.indexOf(kw);
+                    if (idx !== -1) {
+                        const start = Math.max(0, idx - 200);
+                        const end = Math.min(body.length, idx + 2000);
+                        return body.substring(start, end);
+                    }
+                }
+            }
+
+            return null;
+        }
+        """)
+
+        result = ""
         if supplier_text:
-            logger.info(f"Supplier from page: {supplier_text[:80]}...")
+            result = self._parse_supplier_popup(supplier_text)
+            if result:
+                logger.info(f"Supplier from popup: {result[:80]}...")
+            else:
+                logger.info("Popup text found but could not parse supplier")
+                logger.debug(f"Popup text preview: {supplier_text[:300]}...")
         else:
-            logger.info("Supplier not found in popup")
-        return supplier_text
+            logger.info("No supplier-related text found after clicking")
+
+        # Step 5: Close popup/panel
+        try:
+            self.page.evaluate("""
+            () => {
+                const closeBtns = document.querySelectorAll(
+                    'button[aria-label="Close"], button[aria-label="Schließen"], ' +
+                    'button[aria-label="close"], button[aria-label="schließen"], ' +
+                    '[class*="close"], [class*="Close"]'
+                );
+                for (const btn of closeBtns) {
+                    if (btn.offsetParent || window.getComputedStyle(btn).display !== 'none') {
+                        btn.click();
+                        return true;
+                    }
+                }
+                const allBtns = document.querySelectorAll('button');
+                for (const btn of allBtns) {
+                    const t = (btn.textContent || '').trim();
+                    if (t === '×' || t === 'X' || t === '✕') {
+                        btn.click();
+                        return true;
+                    }
+                }
+                return false;
+            }
+            """)
+        except Exception:
+            pass
+
+        try:
+            self.page.keyboard.press("Escape")
+            time.sleep(0.3)
+        except Exception:
+            pass
+
+        return result
 
     @staticmethod
     def _parse_supplier_popup(text: str) -> str:
-        """Parse supplier info from product safety popup text."""
         if not text:
             return ""
 
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
-        start_markers = [
+        colon_markers = [
+            "wirtschaftsakteur",
+            "economic operator",
             "located in the eu",
-            "in der eu befindet",
-            "in der eu angesiedelt",
-            "the economic operator responsible",
-            "der wirtschaftsakteur",
+            "in der eu",
+            "responsible person",
             "verantwortliche person",
-            "responsible person for the eu",
         ]
 
         start_idx = -1
         for i, line in enumerate(lines):
             ll = line.lower()
-            if any(m in ll for m in start_markers):
-                start_idx = i
+            if line.rstrip().endswith(":"):
+                if any(m in ll for m in colon_markers):
+                    start_idx = i
+                    break
+            for marker in colon_markers:
+                pos = ll.find(marker)
+                if pos != -1:
+                    colon_pos = line.find(":", pos)
+                    if colon_pos != -1:
+                        after = line[colon_pos + 1:].strip()
+                        if after and len(after) > 3:
+                            collected = [after]
+                            for j in range(i + 1, min(i + 7, len(lines))):
+                                jl = lines[j].lower()
+                                if _is_stop_line(jl):
+                                    break
+                                if _is_junk_line(lines[j]):
+                                    continue
+                                collected.append(lines[j])
+                            if collected:
+                                return re.sub(r"\s+", " ",
+                                              " ".join(collected)).strip()
+                        else:
+                            start_idx = i
+                            break
+            if start_idx != -1:
                 break
+
+        if start_idx == -1:
+            fallback_markers = [
+                "located in the eu",
+                "in der eu befindet",
+                "in der eu angesiedelt",
+                "in der eu ansässig",
+                "the economic operator responsible",
+                "der wirtschaftsakteur",
+                "verantwortliche person",
+                "responsible person for the eu",
+                "verantwortlich für dieses produkt",
+            ]
+            for i, line in enumerate(lines):
+                ll = line.lower()
+                if any(m in ll for m in fallback_markers):
+                    start_idx = i
+                    break
 
         if start_idx == -1:
             return ""
 
         collected = []
-        stop_markers = [
-            "you can also find", "sie finden", "sie können",
-            "important information", "wichtige informationen",
-            "report legal", "rechtliche bedenken",
-            "return instruction", "rücksendeh",
-            "disposal instruction", "entsorgungsh",
-            "details on product", "details zur produkt",
-            "discover another", "entdecke",
-            "interesting alternative", "interessante alternative",
-            "purchase on account", "kauf auf rechnung",
-            "30-day", "30 tage",
-            "https://", "http://",
-            "attention:", "achtung:",
-        ]
-
-        for i in range(start_idx + 1, min(start_idx + 7, len(lines))):
+        for i in range(start_idx + 1, min(start_idx + 8, len(lines))):
             ll = lines[i].lower()
-            if any(s in ll for s in stop_markers):
+            if _is_stop_line(ll):
                 break
-            if any(m in ll for m in start_markers):
-                continue
-            if len(lines[i]) < 3 or len(lines[i]) > 200:
-                continue
-            if lines[i] in ("×", "X", "Close", "Schließen", "OK"):
+            if _is_junk_line(lines[i]):
                 continue
             collected.append(lines[i])
 
         if collected:
             return re.sub(r"\s+", " ", " ".join(collected)).strip()
         return ""
+def _is_stop_line(ll: str) -> bool:
+    """Check if a lowercased line is a stop marker for supplier collection."""
+    stop_markers = [
+        "you can also find", "sie finden", "sie können",
+        "du findest",
+        "important information", "wichtige informationen",
+        "report legal", "rechtliche bedenken",
+        "return instruction", "rücksendeh",
+        "disposal instruction", "entsorgungsh",
+        "details on product", "details zur produkt",
+        "discover another", "entdecke",
+        "interesting alternative", "interessante alternative",
+        "purchase on account", "kauf auf rechnung",
+        "30-day", "30 tage",
+        "https://", "http://",
+        "attention:", "achtung:",
+        "hinweis:", "bitte beachten",
+    ]
+    return any(s in ll for s in stop_markers)
+
+
+def _is_junk_line(line: str) -> bool:
+    """Check if a line is UI junk that should be skipped."""
+    if len(line) < 3 or len(line) > 200:
+        return True
+    if line in ("×", "X", "Close", "Schließen", "OK",
+                "Details zur Produktsicherheit",
+                "Details on product safety",
+                "Verantwortliche Person für die EU",
+                "Responsible person for the EU"):
+        return True
+    return False
+
+
 # ============================================================================
 
 class PDFExtractor:
@@ -1351,27 +1648,17 @@ class PDFExtractor:
         return ""
 
     def _supplier_address_table(self, text: str) -> str:
-        """Handle Apple-style PDFs where 'Supplier's address (a) (b) (g)'
-        is followed by the company name on the same or next lines.
-        Example from Apple PDF:
-          Supplier's address (a) (b) (g)  Apple Distribution International Limited
-                                           Hollyhill Industrial Estate
-                                           T23 YK84 Cork Ireland
-        """
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         lls = [l.lower() for l in lines]
 
         for i, ll in enumerate(lls):
             if "supplier" in ll and "address" in ll:
-                # Check if value is on the same line after annotation markers
-                # e.g., "Supplier's address (a) (b) (g) Apple Distribution..."
                 m = re.search(
                     r"supplier'?s?\s*address\s*(?:\([a-z]\)\s*)*(.+)",
                     lines[i], re.I)
                 if m:
                     val = m.group(1).strip()
                     if val and len(val) > 5 and not val.startswith("("):
-                        # Collect multi-line address
                         collected = [val]
                         for j in range(i + 1, min(i + 5, len(lines))):
                             if self._heading(lines[j]):
@@ -1383,7 +1670,6 @@ class PDFExtractor:
                             collected.append(lines[j])
                         return " ".join(collected)
 
-                # Value is on next lines
                 collected = []
                 for j in range(i + 1, min(i + 5, len(lines))):
                     if self._heading(lines[j]):
@@ -1587,7 +1873,8 @@ class Scraper:
             # Energy level image link from page DOM
             energy_img = nav.get_energy_image_link()
 
-            # Supplier from "Details zur Produktsicherheit" popup
+            # Supplier ONLY from "Details zur Produktsicherheit" popup
+            # Never from PDF — user requirement
             supplier = nav.get_supplier_from_page()
 
             # PDF link + PDF parsing (supplier fallback only)
@@ -1630,11 +1917,13 @@ class Scraper:
                            "AppleWebKit/537.36",
                 accept_downloads=False)
             page = ctx.new_page()
+            CaptchaSolver.apply_stealth(page)
             page.route("**/*.pdf", lambda r: r.abort())
             page.on("popup", lambda p: p.close())
             page.set_default_timeout(self.config.DEFAULT_TIMEOUT_MS)
             page.set_default_navigation_timeout(self.config.DEFAULT_TIMEOUT_MS)
-            nav = OttoNavigator(page)
+            captcha = CaptchaSolver(self.config)
+            nav = OttoNavigator(page, captcha)
 
             for i, q in enumerate(queries, 1):
                 logger.info(f"\n{'=' * 60}")
