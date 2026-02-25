@@ -1898,13 +1898,192 @@ class Scraper:
             logger.error(f"Error: {query}: {e}")
             return None
 
+    # ------------------------------------------------------------------
+    # SUPPLIER COLUMN PARSER — splits raw text into structured columns
+    # ------------------------------------------------------------------
+    SUPPLIER_EXTRA_FIELDS = [
+        "supplier_company", "supplier_address", "supplier_zip",
+        "supplier_city", "supplier_country", "supplier_email",
+        "supplier_tel",
+        "mfr_address", "mfr_zip", "mfr_city",
+        "mfr_country", "mfr_email", "mfr_tel",
+    ]
+
+    @staticmethod
+    def _parse_address_block(block: str) -> dict:
+        """Parse a single address block into company, address, zip, city,
+        country, email, tel."""
+        r = {"company": "", "address": "", "zip": "", "city": "",
+             "country": "", "email": "", "tel": ""}
+        if not block:
+            return r
+
+        text = block.strip()
+
+        # 1. Extract email
+        em = re.search(r"[\w.\-+]+@[\w.\-]+\.\w{2,}", text)
+        if em:
+            r["email"] = em.group(0)
+            text = (text[:em.start()] + " " + text[em.end():]).strip()
+
+        # 2. Extract tel/phone
+        tm = re.search(
+            r"(?:tel\.?|phone|telefon|fon)[\s:]*"
+            r"([+\d(][\d\s/\-().]{5,})", text, re.I)
+        if tm:
+            r["tel"] = tm.group(1).strip().rstrip(",")
+            text = (text[:tm.start()] + " " + text[tm.end():]).strip()
+        else:
+            tm2 = re.search(r"(\+\d[\d\s/\-().]{7,})", text)
+            if tm2:
+                r["tel"] = tm2.group(1).strip().rstrip(",")
+                text = (text[:tm2.start()] + " " + text[tm2.end():]).strip()
+
+        # Clean up stray punctuation
+        text = re.sub(r"\s+", " ", text).strip().strip(",").strip()
+
+        # 3. Extract country (2-letter code at end, or known names)
+        country_names = [
+            ("Deutschland", "DE"), ("Germany", "DE"),
+            ("Ireland", "IE"), ("Irland", "IE"),
+            ("France", "FR"), ("Frankreich", "FR"),
+            ("Netherlands", "NL"), ("Niederlande", "NL"),
+            ("United States", "US"), ("USA", "US"),
+            ("China", "CN"), ("Japan", "JP"), ("Korea", "KR"),
+            ("United Kingdom", "GB"), ("UK", "GB"),
+            ("Italy", "IT"), ("Italien", "IT"),
+            ("Spain", "ES"), ("Spanien", "ES"),
+            ("Sweden", "SE"), ("Schweden", "SE"),
+            ("Finland", "FI"), ("Finnland", "FI"),
+            ("Denmark", "DK"), ("Dänemark", "DK"),
+            ("Austria", "AT"), ("Österreich", "AT"),
+            ("Switzerland", "CH"), ("Schweiz", "CH"),
+            ("Poland", "PL"), ("Polen", "PL"),
+            ("Czech Republic", "CZ"), ("Tschechien", "CZ"),
+            ("Belgium", "BE"), ("Belgien", "BE"),
+            ("Portugal", "PT"), ("Luxembourg", "LU"),
+        ]
+        # Try 2-letter ISO at end
+        cm = re.search(r"[,\s]+([A-Z]{2})\s*$", text)
+        if cm:
+            r["country"] = cm.group(1)
+            text = text[:cm.start()].strip().rstrip(",").strip()
+        else:
+            for cname, ccode in country_names:
+                if text.lower().rstrip().endswith(cname.lower()):
+                    r["country"] = ccode
+                    text = text[:-(len(cname))].strip().rstrip(",").strip()
+                    break
+
+        # 4. Extract ZIP + city
+        # US style first: "CA 95014 Cupertino"
+        zm_us = re.search(
+            r"\b([A-Z]{2})\s+(\d{5})\s+(.+?)$", text)
+        if zm_us:
+            r["zip"] = zm_us.group(2)
+            r["city"] = zm_us.group(3).strip().rstrip(",").strip()
+            text = text[:zm_us.start()].strip().rstrip(",").strip()
+        else:
+            # German: "65824 Schwalbach"
+            zm = re.search(r"\b(\d{5})\s+(.+?)$", text)
+            if zm:
+                r["zip"] = zm.group(1)
+                r["city"] = zm.group(2).strip().rstrip(",").strip()
+                text = text[:zm.start()].strip().rstrip(",").strip()
+            else:
+                # Irish/UK: "T23 YK84 Cork" or "D04 V2N9 Dublin"
+                zm_ie = re.search(
+                    r"\b([A-Z]\d{1,2}\s*[A-Z0-9]{2,4})\s+(.+?)$", text)
+                if zm_ie:
+                    r["zip"] = zm_ie.group(1)
+                    r["city"] = zm_ie.group(2).strip().rstrip(",").strip()
+                    text = text[:zm_ie.start()].strip().rstrip(",").strip()
+                else:
+                    # Just 5-digit zip anywhere
+                    zm2 = re.search(r"\b(\d{5})\b", text)
+                    if zm2:
+                        r["zip"] = zm2.group(1)
+                        after = text[zm2.end():].strip().lstrip(",").strip()
+                        if after:
+                            r["city"] = after
+                        text = text[:zm2.start()].strip().rstrip(",").strip()
+
+        # 5. Extract company (legal suffix)
+        crx = re.search(
+            r"^(.+?\b(?:GmbH|Ltd\.?|Limited|Inc\.?|Co\.?\s*(?:Ltd|KG)?"
+            r"|AG|SE|BV|S\.?L\.?|SAS|S\.?A\.?|Corp\.?|LLC|OÜ"
+            r"|Pty|plc|e\.?V\.?)\.?)(?=[\s,]|$)",
+            text, re.I)
+        if crx:
+            r["company"] = crx.group(1).strip()
+            text = text[crx.end():].strip().lstrip(",").strip()
+        else:
+            # No legal suffix — use first comma-separated segment
+            parts = text.split(",", 1)
+            if len(parts) == 2 and len(parts[0].strip()) > 3:
+                r["company"] = parts[0].strip()
+                text = parts[1].strip()
+            elif text:
+                r["company"] = text
+                text = ""
+
+        # 6. Address is whatever remains
+        r["address"] = text.strip().strip(",").strip()
+
+        return r
+
+    @staticmethod
+    def _parse_supplier_columns(raw: str) -> dict:
+        """Split raw supplier_information into structured columns
+        matching the spreadsheet layout."""
+        empty = {k: "" for k in Scraper.SUPPLIER_EXTRA_FIELDS}
+        if not raw or raw == "Not found":
+            return empty
+
+        # Split on manufacturer marker
+        mfr_split = re.split(
+            r"\s*(?:Herstellerinformationen|Manufacturer information"
+            r"|Herstelleradresse|Manufacturer address)\s*",
+            raw, maxsplit=1, flags=re.I)
+
+        supplier_part = mfr_split[0].strip()
+        mfr_part = mfr_split[1].strip() if len(mfr_split) > 1 else ""
+
+        sp = Scraper._parse_address_block(supplier_part)
+        mp = Scraper._parse_address_block(mfr_part)
+
+        # Manufacturer: combine company + address into mfr_address
+        mfr_addr = mp["company"]
+        if mp["address"]:
+            mfr_addr = (mfr_addr + " " + mp["address"]).strip()
+
+        return {
+            "supplier_company": sp["company"],
+            "supplier_address": sp["address"],
+            "supplier_zip": sp["zip"],
+            "supplier_city": sp["city"],
+            "supplier_country": sp["country"],
+            "supplier_email": sp["email"],
+            "supplier_tel": sp["tel"],
+            "mfr_address": mfr_addr,
+            "mfr_zip": mp["zip"],
+            "mfr_city": mp["city"],
+            "mfr_country": mp["country"],
+            "mfr_email": mp["email"],
+            "mfr_tel": mp["tel"],
+        }
+
     def run(self):
         queries = self.load_queries()
         results: list[dict] = []
 
         fields = ["input_ean", "product_url", "pdf_link",
                   "energy_efficiency_class", "energylevel_link",
-                  "supplier_information"]
+                  "supplier_company", "supplier_address", "supplier_zip",
+                  "supplier_city", "supplier_country", "supplier_email",
+                  "supplier_tel",
+                  "mfr_address", "mfr_zip", "mfr_city",
+                  "mfr_country", "mfr_email", "mfr_tel"]
 
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -1932,7 +2111,10 @@ class Scraper:
 
                 prod = self.scrape(nav, q)
                 if prod:
-                    results.append(asdict(prod))
+                    row = asdict(prod)
+                    row.update(self._parse_supplier_columns(
+                        row.get("supplier_information", "")))
+                    results.append(row)
                 else:
                     results.append({k: (q if k == "input_ean" else "")
                                     for k in fields})
@@ -1979,7 +2161,19 @@ class Scraper:
             "pdf_link": ("PDF Link", 70),
             "energy_efficiency_class": ("Energy Class", 15),
             "energylevel_link": ("Energy Level Link", 60),
-            "supplier_information": ("Supplier Information", 60),
+            "supplier_company": ("Company", 35),
+            "supplier_address": ("Adress", 35),
+            "supplier_zip": ("ZIP", 12),
+            "supplier_city": ("City", 20),
+            "supplier_country": ("Country", 10),
+            "supplier_email": ("Email", 30),
+            "supplier_tel": ("Tel", 20),
+            "mfr_address": ("Manufacturer Adress", 40),
+            "mfr_zip": ("ZIP", 12),
+            "mfr_city": ("City", 20),
+            "mfr_country": ("Country", 10),
+            "mfr_email": ("Email", 30),
+            "mfr_tel": ("Tel", 20),
         }
 
         bold = Font(bold=True)
